@@ -15,7 +15,10 @@ Standard LLM inference optimizations are designed for two-phase inference (prefi
 ## Getting Started
 
 ### 1. Environment Setup
-```bash
-conda create -n specdvfs python=3.10 -y
-conda activate specdvfs
-pip install -r requirements.txt
+
+**Prerequisite (Windows Users):**
+Ensure you have created a `.wslconfig` file in your `C:\Users\<Your_Username>` directory to allocate enough RAM for model loading:
+```ini
+[wsl2]
+memory=12GB 
+swap=8GB
