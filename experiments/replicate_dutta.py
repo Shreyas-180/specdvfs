@@ -38,21 +38,29 @@ eval_prompts = sampled_prompts[5:]
 # ==========================================
 # 3. MODEL LOADING (NF4 Quantization)
 # ==========================================
+# Updated Model Loading Section
 print("Loading Models onto GPU...")
 tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL_ID)
 
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True, 
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16
+    bnb_4bit_compute_dtype=torch.float16,
+    llm_int8_enable_fp32_cpu_offload=True  # Allows offloading if absolutely necessary
 )
 
 target_model = AutoModelForCausalLM.from_pretrained(
-    TARGET_MODEL_ID, quantization_config=quant_config, device_map="cuda"
+    TARGET_MODEL_ID, 
+    quantization_config=quant_config, 
+    device_map="auto",
+    low_cpu_mem_usage=True  # Reduces RAM usage during the loading phase
 )
 
 draft_model = AutoModelForCausalLM.from_pretrained(
-    DRAFT_MODEL_ID, torch_dtype=torch.float16, device_map="cuda"
+    DRAFT_MODEL_ID, 
+    torch_dtype=torch.float16, 
+    device_map="auto",
+    low_cpu_mem_usage=True
 )
 
 # ==========================================
