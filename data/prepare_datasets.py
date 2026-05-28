@@ -1,31 +1,29 @@
+"""
+Run this ONCE before any experiments.
+Creates the fixed prompt index files that all conditions share.
+"""
 import json
 import random
-import os
+from pathlib import Path
 from datasets import load_dataset
 
-def main():
-    print("Loading GSM-8K...")
-    # Downloads automatically if not cached
-    dataset = load_dataset("gsm8k", "main", split="test")
-    
-    # STRICT CONTROL: Seed 42
-    random.seed(42)
-    
-    all_indices = list(range(len(dataset)))
-    sampled_indices = random.sample(all_indices, 256)
-    
-    sampled_prompts = [dataset[i]["question"] for i in sampled_indices]
-    
-    # Ensure output directory exists
-    output_dir = os.path.join(os.path.dirname(__file__), "sampled_indices")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    output_path = os.path.join(output_dir, "gsm8k_256_seed42.json")
-    
-    with open(output_path, "w") as f:
-        json.dump(sampled_prompts, f, indent=4)
-        
-    print(f"Success! Saved 256 frozen prompts to {output_path}")
+SEED = 42
+random.seed(SEED)
 
-if __name__ == "__main__":
-    main()
+OUTPUT_DIR = Path(__file__).parent / "sampled_indices"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("Loading GSM-8K...")
+gsm8k = load_dataset("gsm8k", "main", split="test")
+
+# Sample 256 prompts — fixed forever
+all_questions = [item["question"] for item in gsm8k]
+sampled = random.sample(all_questions, 256)
+
+out_path = OUTPUT_DIR / "gsm8k_256_seed42.json"
+with open(out_path, "w") as f:
+    json.dump(sampled, f, indent=2)
+
+print(f"Saved {len(sampled)} prompts to {out_path}")
+print("First prompt preview:")
+print(f"  {sampled[0][:80]}...")
