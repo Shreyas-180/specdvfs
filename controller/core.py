@@ -20,11 +20,33 @@ pynvml.nvmlDeviceSetGpuLockedClocks() call.  All decision logic stays here;
 the subclass only adds the hardware call.  This means every logical branch
 in this file is exercised by the unit tests (tests/test_controller.py)
 without requiring a GPU.
+
+MODE-AWARENESS (the per-condition decision policy lives entirely here so the
+CPU unit tests keep full coverage; the patch only juggles attributes):
+
+  adaptive_alpha  (default) — verify clock = verify_freq(lagging α).  Identical
+                              to the original behaviour, so the existing tests
+                              are unchanged.
+  two_level                 — static phase-aware: f_low draft, f_high verify
+                              (α ignored).
+  fixed_low                 — naive global low: f_low on verify too (draft is
+                              already f_low).
+  coarse                    — granularity ablation: ONE clock per ~100 ms window
+                              held across BOTH phases (no per-phase drop).
+  adaptive_entropy          — leading signal: verify clock = verify_freq(α̂) with
+                              α̂ = entropy_to_alpha(last_entropy, entropy_a,
+                              entropy_b); the passed α is ignored.
+  collect                   — calibration pre-pass.  Runs DVFS-off (enabled=False),
+                              so the on_* hooks no-op and the GPU stays at the
+                              default clock; the patch records (last_entropy, α)
+                              pairs into entropy_pairs.  As a clock policy it
+                              degrades to adaptive_alpha if ever run enabled.
 """
 
 from __future__ import annotations
 
 import math
+import time
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -175,6 +197,11 @@ class SimulatedDVFSController:
       on_fallback_decode()        — before non-speculative target-model call
       record_acceptance_rate()    — after scorer returns, with observed α
 
+    The verify-step policy is selected by ``self.mode`` (see module docstring).
+    ``on_verify_start`` is mode-aware, so the patch can keep calling
+    ``on_verify_start(alpha=tracker.estimate)`` unchanged for every condition —
+    each mode decides what (if anything) to do with that α.
+
     Note on rollback: in vLLM's standard SD implementation (COGA, DYGA,
     EAGLE), the "bonus token" generated when draft tokens are rejected is
     computed inside the scorer's target-model forward pass — there is no
@@ -183,36 +210,98 @@ class SimulatedDVFSController:
     but it is not called in the standard vLLM monkey-patch.
     """
 
-    def __init__(self, f_high: int, f_low: int, enabled: bool = True):
+    def __init__(
+        self,
+        f_high: int,
+        f_low: int,
+        enabled: bool = True,
+        mode: str = "adaptive_alpha",
+        entropy_a: float = 1.0,
+        entropy_b: float = -0.35,
+        coarse_window_ms: float = 100.0,
+        now_fn=None,
+    ):
         self.mapper   = FrequencyMapper(f_high, f_low)
         self.tracker  = AcceptanceRateTracker()
         self.enabled  = enabled
+        # Per-condition verify policy.  Default reproduces the original behaviour
+        # exactly, so the existing unit tests are unaffected.
+        self.mode     = mode
+
+        # Entropy (leading-signal) state.  ``last_entropy`` is written by the
+        # patch's forward hook on the draft lm_head; ``entropy_a``/``entropy_b``
+        # are the per-pair α = a·exp(b·H) coefficients (GELATO baseline by
+        # default, overwritten with a fitted result when one exists).
+        self.last_entropy:  Optional[float] = None
+        self.entropy_a:     float = entropy_a
+        self.entropy_b:     float = entropy_b
+        # Filled by the patch in ``collect`` mode: [{'entropy': H, 'alpha': α}, ...].
+        self.entropy_pairs: list = []
+
+        # ``coarse`` ablation: one clock per ~coarse_window_ms window, held across
+        # both phases.  ``now_fn`` is injectable so the window logic is testable
+        # without real time.
+        self._coarse_window_ms = float(coarse_window_ms)
+        self._now_fn           = now_fn if now_fn is not None else time.monotonic
+        self._coarse_freq:      Optional[int]   = None
+        self._coarse_window_t0: Optional[float] = None
+
         self._iter:   int = 0
         self._log:    list = []
 
     # ── injection-point methods (called from vllm_hooks/patch_spec_decode.py) ─
 
     def on_draft_start(self) -> None:
-        """Set GPU to f_low before the draft proposer runs."""
+        """Set the draft-phase GPU clock before the proposer runs.
+
+        Per-phase modes pin f_low (draft is memory-bound, so a higher clock buys
+        no speedup).  The ``coarse`` ablation instead holds the current window
+        clock across BOTH phases — it deliberately does NOT drop to f_low per
+        phase, which is exactly the granularity being ablated.
+        """
         if not self.enabled:
             return
-        freq = self.mapper.draft_freq()
+        if self.mode == "coarse":
+            freq = self._coarse_window_freq()
+        else:
+            freq = self.mapper.draft_freq()
         self.set_frequency_mhz(freq)
         self._record(Phase.DRAFT, freq, None)
 
     def on_verify_start(self, alpha: Optional[float] = None) -> None:
-        """Set GPU frequency before the scorer runs.
+        """Set the verify-phase GPU clock before the scorer runs (mode-aware).
 
-        Uses α from the previous iteration (lagging signal).  If no prior
-        iteration exists, falls back to the tracker's DEFAULT_ALPHA.
+        The mode selects the policy:
+          adaptive_alpha  — verify_freq(lagging α)            [default behaviour]
+          two_level       — always f_high  (α ignored)
+          fixed_low       — always f_low   (draft already f_low → global low)
+          coarse          — the current ~100 ms window clock (one freq / window)
+          adaptive_entropy— verify_freq(α̂), α̂ from last_entropy (passed α ignored)
+          collect / other — degrade to the lagging-α path
 
         Args:
-            alpha: α from the previous iteration, or None to use the tracker.
+            alpha: α from the previous iteration; None → use the tracker.  Only
+                   the adaptive_alpha path consumes it.
         """
         if not self.enabled:
             return
-        a    = alpha if alpha is not None else self.tracker.estimate
-        freq = self.mapper.verify_freq(a)
+        mode = self.mode
+        if mode == "two_level":
+            a, freq = None, self.mapper.f_high
+        elif mode == "fixed_low":
+            a, freq = None, self.mapper.draft_freq()          # f_low on verify too
+        elif mode == "coarse":
+            a, freq = self.tracker.estimate, self._coarse_window_freq()
+        elif mode == "adaptive_entropy":
+            if self.last_entropy is None:                     # hook hasn't fired yet
+                a = alpha if alpha is not None else self.tracker.estimate
+            else:
+                a = self.mapper.entropy_to_alpha(
+                    self.last_entropy, self.entropy_a, self.entropy_b)
+            freq = self.mapper.verify_freq(a)
+        else:                                                 # adaptive_alpha / collect / unknown
+            a = alpha if alpha is not None else self.tracker.estimate
+            freq = self.mapper.verify_freq(a)
         self.set_frequency_mhz(freq)
         self._record(Phase.VERIFY, freq, a)
 
@@ -224,6 +313,11 @@ class SimulatedDVFSController:
         Leading indicator — entropy is available between draft and verify
         within the same iteration, so the frequency is set proactively
         rather than using the previous iteration's result.
+
+        This explicit-argument form is kept for direct use and for the unit
+        tests; the live ``adaptive_entropy`` mode reaches the same logic through
+        ``on_verify_start`` using ``self.last_entropy`` and the stored
+        ``self.entropy_a`` / ``self.entropy_b`` coefficients.
 
         Args:
             entropy:  Shannon entropy of the draft model's final logit distribution.
@@ -262,6 +356,24 @@ class SimulatedDVFSController:
         self.tracker.update(alpha)
         self._iter += 1
 
+    # ── coarse-granularity helper ─────────────────────────────────────────────
+
+    def _coarse_window_freq(self) -> int:
+        """One clock per ~coarse_window_ms window, applied to BOTH phases.
+
+        The clock is chosen with the SAME α→freq rule as adaptive_alpha
+        (``verify_freq`` on the current EMA estimate) but is frozen for the
+        duration of the window.  The only difference from per-phase DVFS is
+        therefore the granularity — which is the point of the ablation.
+        """
+        now = self._now_fn()
+        if (self._coarse_freq is None
+                or self._coarse_window_t0 is None
+                or (now - self._coarse_window_t0) * 1000.0 >= self._coarse_window_ms):
+            self._coarse_window_t0 = now
+            self._coarse_freq = self.mapper.verify_freq(self.tracker.estimate)
+        return self._coarse_freq
+
     # ── hardware interface — override in DVFSController ───────────────────────
 
     def set_frequency_mhz(self, freq_mhz: int) -> None:
@@ -269,6 +381,11 @@ class SimulatedDVFSController:
         log.debug("[sim] set_frequency_mhz(%d)", freq_mhz)
 
     # ── introspection ─────────────────────────────────────────────────────────
+
+    @property
+    def collecting(self) -> bool:
+        """True while running the calibration pre-pass (mode == 'collect')."""
+        return self.mode == "collect"
 
     @property
     def transition_log(self) -> list:
@@ -284,13 +401,16 @@ class SimulatedDVFSController:
     def reset_log(self) -> None:
         self._log.clear()
         self._iter = 0
+        # Start each run with a fresh coarse window so the first draft opens one.
+        self._coarse_freq = None
+        self._coarse_window_t0 = None
 
     def _record(self, phase: Phase, freq: int, alpha: Optional[float]) -> None:
         self._log.append(TransitionRecord(self._iter, phase, freq, alpha))
 
 # ── USAGE ──────────────────────────────────────────────────────────────────────
 # Development (any machine, no GPU required):
-#   pytest tests/test_controller.py -v
+#   pytest tests/test_controller.py tests/test_controller_modes.py -v
 #
 # Server integration:
 #   DVFSController in vllm_hooks/dvfs_controller.py inherits this class

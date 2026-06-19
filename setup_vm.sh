@@ -101,14 +101,17 @@ print(f"    device: {torch.cuda.get_device_name(0)} | capability sm_{''.join(map
 PY
 
 echo "==> [4/7] Hugging Face auth"
-# The re-scoped PILOT pair (Qwen3-8B/0.6B) is UNGATED — no token needed to run it.
-# You only need HF auth for the gated Llama pair used in the full study.
+# The PILOT now uses the Llama pair (Llama-3.1-8B / 3.2-1B), which is GATED — vLLM
+# 0.6.6 (pinned for the patch's spec_decode hooks) predates Qwen3, so Qwen3 will
+# not load on it. You therefore NEED HF auth (and access granted to the Llama repos)
+# before the pilot, not just the full study.
 if [ -n "$HF_TOKEN" ]; then
   python -c "from huggingface_hub import login; login('$HF_TOKEN')"
   echo "    logged in via HF_TOKEN."
 else
-  echo "    HF_TOKEN not set — fine for the Qwen3 pilot. For the gated Llama full-study"
-  echo "    pair, run:  huggingface-cli login"
+  echo "    WARN: HF_TOKEN not set. The Llama pilot pair is GATED and WILL FAIL to"
+  echo "    download without auth. Run:  huggingface-cli login   (and accept the"
+  echo "    Llama-3.1-8B-Instruct / Llama-3.2-1B-Instruct licenses on huggingface.co)."
 fi
 
 echo "==> [5/7] Project code"
@@ -151,7 +154,15 @@ PY
 
 echo "==> [7/7] Datasets + integrity + MD5"
 python data/prepare_datasets.py
-python data/verify_datasets.py        # prints MD5s — RECORD THESE in your lab notebook
+# The verifier prints MD5s — RECORD THESE in your lab notebook. Tolerate either
+# filename (the repo may name it verify_dataset.py or verify_datasets.py).
+if [ -f data/verify_datasets.py ]; then
+  python data/verify_datasets.py
+elif [ -f data/verify_dataset.py ]; then
+  python data/verify_dataset.py
+else
+  echo "    WARN: no data/verify_dataset(s).py found — skipping integrity/MD5 check."
+fi
 
 echo
 echo "============================================================"
@@ -159,5 +170,6 @@ echo "  SETUP COMPLETE."
 echo "  - Record the MD5 checksums and the clock range printed above."
 echo "  - Project uses f_high=1935, f_low=735 for the RTX 3090"
 echo "    (a chosen low level + the sustainable max — NOT the absolute min/max)."
+echo "  - Pilot pair is GATED Llama-3.1-8B / 3.2-1B: make sure HF auth succeeded above."
 echo "  - Next:  python experiments/run_experiment.py --mode pilot"
 echo "============================================================"
