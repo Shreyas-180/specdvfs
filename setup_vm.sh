@@ -15,7 +15,7 @@
 #   [2] Enable persistence mode.
 #   [3] Create the `specdvfs` conda env + install the pinned stack.
 #   [4] Authenticate to Hugging Face (gated Llama models need this).
-#   [5] Pull the project code.
+#   [5] Confirm the project code is present (you copy it over first via push_to_vm.sh).
 #   [6] VERIFY NVML CLOCK-LOCKING WORKS   <-- GO/NO-GO for the whole project.
 #   [7] Prepare + verify datasets, print MD5 checksums (record them!).
 #
@@ -29,19 +29,15 @@ set -euo pipefail
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
 # ----------------------------- EDIT THESE ------------------------------------
-# Fill these two in. Either edit the values here, OR export them before running:
-#     export REPO_URL=https://github.com/janedoe/specdvfs.git
+# Only HF_TOKEN needs filling in. Either edit it here, OR export it before running:
 #     export HF_TOKEN=hf_AbCd1234EXAMPLE5678
 #     bash setup_vm.sh
 #
-# Example of the lines fully filled in (editing in place):
-#     REPO_URL="https://github.com/janedoe/specdvfs.git"
-#     HF_TOKEN="hf_AbCd1234EXAMPLE5678wXyZ"
-# CONDA_ENV / PROJECT_DIR have sensible defaults — only change if you want to.
-REPO_URL="${REPO_URL:-https://github.com/<your-username>/specdvfs.git}"  # <-- your repo, or rsync the code instead
+# The project code is NOT cloned here — you copy it onto the VM first with
+# push_to_vm.sh (run on your laptop), then run this script from inside that folder.
+# CONDA_ENV has a sensible default; only change it if you want to.
 HF_TOKEN="${HF_TOKEN:-}"          # <-- hf_... token (needed for gated meta-llama models), or leave blank + log in interactively
 CONDA_ENV="${CONDA_ENV:-specdvfs}"
-PROJECT_DIR="${PROJECT_DIR:-$HOME/specdvfs}"
 # -----------------------------------------------------------------------------
 
 echo "============================================================"
@@ -100,6 +96,26 @@ assert torch.cuda.is_available(), "torch cannot see the GPU"
 print(f"    device: {torch.cuda.get_device_name(0)} | capability sm_{''.join(map(str, torch.cuda.get_device_capability(0)))}")
 PY
 
+echo "    Nsight Compute (ncu) — required for profiling/prof_roofline.py (Phase 3)."
+echo "    Installed into the conda env so no sudo/apt-repo wrangling is needed."
+if command -v ncu >/dev/null 2>&1; then
+  echo "    ncu already on PATH: $(ncu --version | head -1)"
+else
+  conda install -y -c nvidia nsight-compute || \
+    echo "    WARN: 'conda install -c nvidia nsight-compute' failed. Profiling (Phase 3)" \
+         "will be unavailable until ncu is installed — see" \
+         "https://developer.nvidia.com/tools-overview/nsight-compute/get-started" \
+         "for the apt/cuda-toolkit-repo alternative."
+  if command -v ncu >/dev/null 2>&1; then
+    echo "    installed: $(ncu --version | head -1)"
+  fi
+fi
+# Common cloud-GPU gotcha: GPU performance counters are often locked to admin-only
+# (NVreg_RestrictProfilingToAdminUsers). If profiling/prof_roofline.py later fails
+# under ncu with "ERR_NVGPUCTRPERM", prefix the ncu command with sudo, e.g.:
+#   sudo env "PATH=$PATH" ncu --nvtx ...
+# (sudo drops the conda env's PATH by default, hence the explicit "env PATH=$PATH").
+
 echo "==> [4/7] Hugging Face auth"
 # The PILOT now uses the Llama pair (Llama-3.1-8B / 3.2-1B), which is GATED — vLLM
 # 0.6.6 (pinned for the patch's spec_decode hooks) predates Qwen3, so Qwen3 will
@@ -114,13 +130,15 @@ else
   echo "    Llama-3.1-8B-Instruct / Llama-3.2-1B-Instruct licenses on huggingface.co)."
 fi
 
-echo "==> [5/7] Project code"
-if [ ! -d "$PROJECT_DIR" ]; then
-  git clone "$REPO_URL" "$PROJECT_DIR" || {
-    echo "    WARN: git clone failed. rsync your code into $PROJECT_DIR before continuing."
-  }
+echo "==> [5/7] Project code (expected to be already here, copied via push_to_vm.sh)"
+# We run from inside the project folder, so just confirm the key files arrived.
+if [ ! -f experiments/run_experiment.py ] || [ ! -f controller/core.py ]; then
+  echo "    FATAL: this doesn't look like the specdvfs folder — run setup_vm.sh from"
+  echo "    inside the directory you pushed (e.g.  cd ~/specdvfs && bash setup_vm.sh )."
+  echo "    If you haven't copied the code yet, run push_to_vm.sh on your laptop first."
+  exit 1
 fi
-cd "$PROJECT_DIR" 2>/dev/null || { echo "FATAL: $PROJECT_DIR not present"; exit 1; }
+echo "    code present: $(pwd)"
 
 echo "==> [6/7] *** CLOCK-LOCK VERIFICATION (GO/NO-GO) ***"
 python - <<'PY'
@@ -171,5 +189,8 @@ echo "  - Record the MD5 checksums and the clock range printed above."
 echo "  - Project uses f_high=1935, f_low=735 for the RTX 3090"
 echo "    (a chosen low level + the sustainable max — NOT the absolute min/max)."
 echo "  - Pilot pair is GATED Llama-3.1-8B / 3.2-1B: make sure HF auth succeeded above."
+echo "  - ncu (Nsight Compute) was installed for Phase 3 roofline profiling — if it's"
+echo "    missing, see step [3]'s WARN above; if it errs with ERR_NVGPUCTRPERM at"
+echo "    profiling time, re-run that ncu command with sudo (see step [3]'s note)."
 echo "  - Next:  python experiments/run_experiment.py --mode pilot"
 echo "============================================================"

@@ -1,17 +1,7 @@
-# Python
 __pycache__/
-*.pyc
-
-# Environments
-.env
-.venv
-env/
-venv/
-
-# Results and Data
-results/*
-!results/.gitkeep
-data/sampled_indices/*.json
-
-# HuggingFace / CodeCarbon
-emissions.csv
+results/
+calibration/*.json
+calibration/*.png
+data/sampled_indices/
+profiling/out/
+collect_and_destroy.local.sh
