@@ -107,22 +107,30 @@ FULL_CONDITIONS = SUPPORTED_CONDITIONS + PENDING_CONDITIONS
 # baseline). For these, the condition name IS the controller.mode value dispatched in core.py.
 DVFS_MODE_CONDITIONS = [c for c in (SUPPORTED_CONDITIONS + PENDING_CONDITIONS) if c != "off"]
 
-# ---- PILOT (core mechanism validation on the supported conditions) ----
+# ---- PILOT (exercise the code that actually differs across DVFS conditions) ----
 # NOTE: pilot uses the Llama pair, not Qwen3 — vLLM 0.6.6 (pinned for the patch's
 # spec_decode hooks) predates the Qwen3 architecture, so Qwen3 will not load on it.
 # Llama-3.1-8B / 3.2-1B are supported by 0.6.6 (they are GATED — needs HF auth).
+#
+# The pilot's job is to surface bugs/mismatches before the full sweep, so it holds
+# the model AND the SD strategy fixed and sweeps ALL SIX DVFS conditions — that is
+# where the new, least-tested code lives (the mode-aware on_verify_start dispatch,
+# and for adaptive_entropy the entropy lm_head hook + calibration chain). A single
+# vanilla (no-SD) reference is included so energy/latency have a baseline.
 PILOT_MODEL = "llama_8b_1b"
 PILOT_STRATEGY = "spec_g5"
 PILOT_DATASET = "gsm8k"
 PILOT_N_PROMPTS = 64
-PILOT_REPS = 3
+PILOT_REPS = 1
 FULL_REPS = 5
 
-PILOT_MATRIX = [
-    (PILOT_MODEL, "vanilla",      "off",            PILOT_DATASET),  # reference (no SD)
-    (PILOT_MODEL, PILOT_STRATEGY, "off",            PILOT_DATASET),  # SD without DVFS
-    (PILOT_MODEL, PILOT_STRATEGY, "adaptive_alpha", PILOT_DATASET),  # SD + adaptive per-phase DVFS
-]
+# One row per DVFS condition (all of FULL_CONDITIONS) on the fixed model+strategy,
+# plus a vanilla reference. Built from FULL_CONDITIONS so it can never drift out of
+# sync with the set of conditions the controller actually supports.
+PILOT_MATRIX = (
+    [(PILOT_MODEL, "vanilla", "off", PILOT_DATASET)]   # reference (no SD)
+    + [(PILOT_MODEL, PILOT_STRATEGY, cond, PILOT_DATASET) for cond in FULL_CONDITIONS]
+)
 
 
 def build_full_matrix():
@@ -150,8 +158,15 @@ def build_full_matrix():
 
 GELATO_BASELINE_AB = (1.0, -0.35)
 CALIB_GAMMA = 5
-CALIB_DATASET = "gsm8k"
-CALIB_N_PROMPTS = 128
+# Calibrate across ALL dataset types, not just one — a single dataset risks narrow
+# entropy coverage (e.g. GSM8K's fairly formulaic math steps), which would leave the
+# fitted curve poorly constrained outside that range. The total prompt budget is
+# spread across types instead of concentrated in one.
+CALIB_DATASETS = list(DATASETS)
+CALIB_N_PROMPTS = 128       # TOTAL across CALIB_DATASETS, split as evenly as possible
+                            # (64 over 3 types -> 22/21/21). Each prompt yields many
+                            # (entropy, alpha) pairs (one per decode step), so the fit
+                            # still sees >> CALIB_MIN_PAIRS samples.
 CALIB_MIN_PAIRS = 200
 CALIB_MIN_R2 = 0.5
 
@@ -205,6 +220,19 @@ def fit_and_save_calibration(model_pair, pairs):
     return result
 
 
+def calibration_prompts(family, mock=False):
+    """CALIB_N_PROMPTS prompts total, split as evenly as possible across CALIB_DATASETS
+    (e.g. 128 over 3 types -> 43/43/42). Combined into one list — one build_llm/generate
+    pass per model pair, not one per dataset, so calibration cost doesn't multiply."""
+    n = len(CALIB_DATASETS)
+    base, extra = divmod(CALIB_N_PROMPTS, n)   # extra goes to the first `extra` datasets
+    prompts = []
+    for i, ds in enumerate(CALIB_DATASETS):
+        k = base + (1 if i < extra else 0)
+        prompts += load_prompts(ds, family, k, mock=mock)
+    return prompts
+
+
 def calibrate_pairs_if_needed(matrix, mock=False, recalibrate=False):
     pairs = [mp for mp in dict.fromkeys(m[0] for m in matrix)
              if any(x[0] == mp and x[2] == "adaptive_entropy" for x in matrix)
@@ -213,7 +241,7 @@ def calibrate_pairs_if_needed(matrix, mock=False, recalibrate=False):
         return
     print(f"== AUTO-CALIBRATION for {pairs} ==")
     for mp in pairs:
-        prompts = load_prompts(CALIB_DATASET, MODEL_PAIRS[mp]["family"], CALIB_N_PROMPTS, mock=mock)
+        prompts = calibration_prompts(MODEL_PAIRS[mp]["family"], mock=mock)
         llm = build_llm(mp, f"spec_g{CALIB_GAMMA}", mock)
         controller = retrieve_controller(llm, mock)
         got = collect_entropy_pairs(llm, controller, prompts, mock)
@@ -581,6 +609,8 @@ def main():
     ap.add_argument("--mock", action="store_true", help="laptop dry-run: stub vLLM + NVML")
     ap.add_argument("--n-prompts", type=int, default=None)
     ap.add_argument("--allow-clock-mismatch", action="store_true")
+    ap.add_argument("--recalibrate", action="store_true",
+                    help="refit entropy calibration even if calibration/fitted_<pair>.json exists")
     args = ap.parse_args()
 
     global F_HIGH, F_LOW
@@ -602,7 +632,7 @@ def main():
     # Entropy auto-calibration: the patch now supports 'collect' mode, so fit α = a·exp(b·H)
     # for any model pair that has an adaptive_entropy condition and no cached fit. This runs
     # DVFS-off and writes calibration/fitted_<pair>.json (GELATO baseline if it yields none).
-    calibrate_pairs_if_needed(matrix, args.mock)
+    calibrate_pairs_if_needed(matrix, args.mock, recalibrate=args.recalibrate)
 
     completed = False
     matrix.sort(key=lambda x: (x[0], x[1]))
