@@ -31,10 +31,18 @@ VAST_INSTANCE_ID=""            # OPTIONAL: from `vastai show instances`. BLANK =
 mkdir -p "$LOCAL_DEST"
 
 echo "==> [1/3] checking SSH to ${VM_USER}@${VM_HOST} port ${VM_PORT} ..."
-ssh -p "$VM_PORT" "${VM_USER}@${VM_HOST}" 'echo "    connected to $(hostname)"' || {
-  echo "    FATAL: cannot SSH in. Re-check VM_USER / VM_HOST / VM_PORT."
+if ! ssh -p "$VM_PORT" "${VM_USER}@${VM_HOST}" 'echo "    connected to $(hostname)"'; then
+  if ssh-keygen -F "[${VM_HOST}]:${VM_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1; then
+    echo "    FATAL: reached the host fine (host/port are correct) but your key was"
+    echo "    rejected — 'Permission denied (publickey)'. Fix: vastai attach ssh"
+    echo "    <instance_id> \"\$(cat ~/.ssh/id_ed25519.pub)\" — see push_to_vm.sh's"
+    echo "    matching error for the full command sequence. Adding a key to your Vast"
+    echo "    ACCOUNT only reaches instances created after that, not this running one."
+  else
+    echo "    FATAL: cannot reach the host at all. Re-check VM_USER / VM_HOST / VM_PORT."
+  fi
   exit 1
-}
+fi
 
 echo "==> [2/3] pulling results + profiling/out + calibration -> ${LOCAL_DEST}/ ..."
 # tar whatever of these dirs exists on the VM (missing ones are skipped, not fatal),
