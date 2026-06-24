@@ -64,14 +64,30 @@ echo "==> [2/7] Enable persistence mode"
 $SUDO nvidia-smi -pm 1 || echo "    WARN: could not enable persistence mode (continuing)"
 
 echo "==> [3/7] Conda env + pinned stack"
-if ! command -v conda >/dev/null 2>&1; then
+# Don't just check PATH: cloud-GPU template images frequently ship Miniconda
+# already installed (often at exactly $HOME/miniconda3) but not on PATH for a
+# non-interactive script shell. Checking PATH alone would conclude "not
+# installed" and try to install fresh into a directory that's already occupied,
+# which fails loudly ("File or directory already exists") even though conda is
+# right there. Check the common pre-baked locations by PATH before installing.
+if command -v conda >/dev/null 2>&1; then
+  echo "    conda already on PATH: $(command -v conda)"
+  eval "$(conda shell.bash hook)"
+elif [ -x "$HOME/miniconda3/bin/conda" ]; then
+  echo "    found existing Miniconda at $HOME/miniconda3 (not on PATH for this shell) — using it"
+  eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
+elif [ -x "/opt/conda/bin/conda" ]; then
+  echo "    found existing conda at /opt/conda (not on PATH for this shell) — using it"
+  eval "$("/opt/conda/bin/conda" shell.bash hook)"
+else
   echo "    installing Miniconda..."
   curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/mc.sh
-  bash /tmp/mc.sh -b -p "$HOME/miniconda3"
+  # -u (update-in-place) is defense-in-depth: if $HOME/miniconda3 exists but wasn't
+  # caught above (e.g. a partial/broken prior install with no working binary), -b
+  # alone would still hard-fail with "already exists"; -b -u repairs/updates in place.
+  bash /tmp/mc.sh -b -u -p "$HOME/miniconda3"
   eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
   conda init bash
-else
-  eval "$(conda shell.bash hook)"
 fi
 
 conda create -y -n "$CONDA_ENV" python=3.10
@@ -84,7 +100,13 @@ python -m pip install --upgrade pip
 # vLLM 0.6.6 pulls a compatible torch (2.5.1). Let it resolve, then verify the
 # CUDA build below. NOTE: do NOT add the WSL PATH fix here — that is laptop-only.
 pip install "vllm==0.6.6"
-pip install "transformers>=4.47" accelerate bitsandbytes datasets \
+# transformers MUST stay below v5: v5 reworked the tokenizer internals (new
+# TokenizersBackend class) and dropped attributes vLLM 0.6.6's tokenizer code
+# calls directly (e.g. all_special_tokens_extended) -> AttributeError at LLM(...)
+# construction. vLLM 0.6.6 (Dec 2024) predates any v5 support entirely. An
+# unbounded ">=4.47" silently installs whatever is newest today, which by now is
+# v5.x — pin the upper bound explicitly so this can't regress on a future setup.
+pip install "transformers>=4.47,<5.0.0" accelerate bitsandbytes datasets \
             nvidia-ml-py codecarbon scipy numpy pandas matplotlib seaborn huggingface_hub
 
 # If torch's bundled CUDA build mismatches the 12.9 driver, force-reinstall, e.g.:
