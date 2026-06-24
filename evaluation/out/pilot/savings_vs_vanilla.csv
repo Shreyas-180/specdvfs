@@ -1,0 +1,7 @@
+model_pair,strategy,gamma,dataset,dvfs_condition,gpu_energy_ratio_vs_vanilla,speedup_vs_vanilla
+llama_8b_1b,spec_g5,5,gsm8k,adaptive_alpha,1.9150468484465402,1.029076695025269
+llama_8b_1b,spec_g5,5,gsm8k,adaptive_entropy,1.9007805619653306,1.0349722875524063
+llama_8b_1b,spec_g5,5,gsm8k,coarse,1.6038805909626586,1.1464647469602456
+llama_8b_1b,spec_g5,5,gsm8k,fixed_low,1.8583416268603379,0.8484105854159315
+llama_8b_1b,spec_g5,5,gsm8k,off,1.600084529304542,1.3408421840861318
+llama_8b_1b,spec_g5,5,gsm8k,two_level,1.8862552423761185,1.0215056708361108

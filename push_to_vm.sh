@@ -17,19 +17,37 @@ set -euo pipefail
 
 # ----- EDIT THESE (read them off the Vast.ai SSH command: ssh -p PORT USER@HOST) -----
 VM_USER="root"            # the USER in  ssh -p PORT USER@HOST
-VM_HOST="1.2.3.4"         # the HOST/IP
-VM_PORT="12345"           # the PORT  (-p)
+VM_HOST="153.198.33.174"         # the HOST/IP
+VM_PORT="50593"           # the PORT  (-p)
 REMOTE_DIR="specdvfs"     # folder to create in the VM's home dir; leave as-is
 # -------------------------------------------------------------------------------------
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"   # this repo = the folder this script lives in
 
 echo "==> [1/2] checking SSH to ${VM_USER}@${VM_HOST} port ${VM_PORT} ..."
-ssh -p "$VM_PORT" "${VM_USER}@${VM_HOST}" 'echo "    connected to $(hostname)"' || {
-  echo "    FATAL: cannot SSH in. Re-check VM_USER / VM_HOST / VM_PORT against the"
-  echo "    exact 'ssh -p PORT USER@HOST' line on the Vast.ai Instances page."
+if ! ssh -p "$VM_PORT" "${VM_USER}@${VM_HOST}" 'echo "    connected to $(hostname)"'; then
+  # If the host is already in known_hosts, the TCP connection + host-key step
+  # succeeded earlier (this run or the last) — so host/port are fine, and ANY
+  # failure here is purely an auth/key problem, not a wrong-address problem.
+  if ssh-keygen -F "[${VM_HOST}]:${VM_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1; then
+    echo "    FATAL: reached the host fine (host/port are correct) but your key was"
+    echo "    rejected — 'Permission denied (publickey)'. Vast.ai instances accept SSH"
+    echo "    keys only, and adding a key to your ACCOUNT only affects instances created"
+    echo "    AFTER that — it does NOT retroactively reach this already-running one."
+    echo "    Fix: open this instance on the Vast.ai console, use its INSTANCE-SPECIFIC"
+    echo "    'Add SSH Key' field (not the account-wide Manage Keys page) and paste:"
+    echo "        $(cat ~/.ssh/id_ed25519.pub 2>/dev/null || echo '<run: cat ~/.ssh/id_ed25519.pub>')"
+    echo "    No local key yet? generate one first:  ssh-keygen -t ed25519"
+    echo "    No SSH-key field on that instance? Open its Jupyter Terminal (web-based,"
+    echo "    no key needed) instead and run there:"
+    echo "        echo \"\$(cat ~/.ssh/id_ed25519.pub)\" >> ~/.ssh/authorized_keys"
+    echo "    More detail:  ssh -vv -p ${VM_PORT} ${VM_USER}@${VM_HOST}"
+  else
+    echo "    FATAL: cannot reach the host at all. Re-check VM_USER / VM_HOST / VM_PORT"
+    echo "    against the exact 'ssh -p PORT USER@HOST' line on the Vast.ai Instances page."
+  fi
   exit 1
-}
+fi
 
 echo "==> [2/2] copying code from ${LOCAL_DIR} -> ${VM_USER}@${VM_HOST}:~/${REMOTE_DIR} ..."
 # Pack the repo (minus junk + generated artifacts) and unpack it on the VM in one pipe.
