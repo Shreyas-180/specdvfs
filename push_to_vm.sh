@@ -17,8 +17,8 @@ set -euo pipefail
 
 # ----- EDIT THESE (read them off the Vast.ai SSH command: ssh -p PORT USER@HOST) -----
 VM_USER="root"            # the USER in  ssh -p PORT USER@HOST
-VM_HOST="153.198.33.174"         # the HOST/IP
-VM_PORT="50593"           # the PORT  (-p)
+VM_HOST="1.2.3.4"         # the HOST/IP
+VM_PORT="12345"           # the PORT  (-p)
 REMOTE_DIR="specdvfs"     # folder to create in the VM's home dir; leave as-is
 # -------------------------------------------------------------------------------------
 
@@ -34,14 +34,19 @@ if ! ssh -p "$VM_PORT" "${VM_USER}@${VM_HOST}" 'echo "    connected to $(hostnam
     echo "    rejected — 'Permission denied (publickey)'. Vast.ai instances accept SSH"
     echo "    keys only, and adding a key to your ACCOUNT only affects instances created"
     echo "    AFTER that — it does NOT retroactively reach this already-running one."
-    echo "    Fix: open this instance on the Vast.ai console, use its INSTANCE-SPECIFIC"
-    echo "    'Add SSH Key' field (not the account-wide Manage Keys page) and paste:"
-    echo "        $(cat ~/.ssh/id_ed25519.pub 2>/dev/null || echo '<run: cat ~/.ssh/id_ed25519.pub>')"
+    echo "    Fix (unambiguous, confirmed via Vast.ai's own CLI docs):"
+    echo "        pip install vastai"
+    echo "        vastai set api-key <YOUR_VAST_API_KEY>      # from https://cloud.vast.ai/cli/"
+    echo "        vastai show instances                        # find this instance's ID"
+    echo "        vastai attach ssh <instance_id> \"\$(cat ~/.ssh/id_ed25519.pub)\""
     echo "    No local key yet? generate one first:  ssh-keygen -t ed25519"
+    echo "    Still rejected after attach? it may need the instance restarted to pick up"
+    echo "    the new authorized_keys — restart it from the Vast.ai console, then retry."
     echo "    No SSH-key field on that instance? Open its Jupyter Terminal (web-based,"
     echo "    no key needed) instead and run there:"
     echo "        echo \"\$(cat ~/.ssh/id_ed25519.pub)\" >> ~/.ssh/authorized_keys"
-    echo "    More detail:  ssh -vv -p ${VM_PORT} ${VM_USER}@${VM_HOST}"
+    echo "    More detail (shows exactly which key was offered/rejected):"
+    echo "        ssh -vv -p ${VM_PORT} ${VM_USER}@${VM_HOST}"
   else
     echo "    FATAL: cannot reach the host at all. Re-check VM_USER / VM_HOST / VM_PORT"
     echo "    against the exact 'ssh -p PORT USER@HOST' line on the Vast.ai Instances page."
