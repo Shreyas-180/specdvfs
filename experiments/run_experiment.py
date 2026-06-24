@@ -51,6 +51,23 @@ F_HIGH = 1935          # confirmed RTX 3090 sustainable-lock ceiling
 F_LOW = 735            # confirmed chosen low level
 SEED = 42
 
+# bitsandbytes is OFF by default: on this stack (vLLM 0.6.6 + Llama-3.2-1B draft),
+# loading the draft model under `load_format="bitsandbytes"` crashes during weight
+# loading (RuntimeError in linear.py's weight_loader narrow() — confirmed by tracing
+# vLLM 0.6.6's own BitsAndBytesModelLoader: load_format is one engine-wide setting,
+# so it's NOT possible to bnb-quantize the target while loading the draft in plain
+# bf16 within a single LLM(...) call; on-the-fly bnb quantization unconditionally
+# runs for every model the engine loads, target AND draft, and the 1B model's
+# checkpoint layout breaks it). Loading both models native bf16 avoids the bug
+# entirely; MAX_MODEL_LEN below keeps KV cache memory small enough to still fit a
+# 24GB GPU. If a later vLLM build fixes the bnb+draft interaction, flip this back on.
+USE_BNB_QUANTIZATION = False
+MAX_MODEL_LEN = 2048   # plenty for GSM8K/HumanEval/CNN-DM prompts + MAX_NEW_TOKENS;
+                       # keeps the bf16 KV cache footprint small on a 24GB GPU.
+MAX_NUM_SEQS = 8       # caps concurrent-batch size; bounds the rejection sampler's
+                       # per-step tensor (scales with batch_size x gamma x vocab_size)
+                       # that caused the OOM seen with the default (256) concurrency.
+
 TEMP_LIMIT_C = 75
 WARMUP_PROMPTS = 5
 COOLDOWN_S = 30
@@ -121,7 +138,7 @@ PILOT_MODEL = "llama_8b_1b"
 PILOT_STRATEGY = "spec_g5"
 PILOT_DATASET = "gsm8k"
 PILOT_N_PROMPTS = 64
-PILOT_REPS = 1
+PILOT_REPS = 3
 FULL_REPS = 5
 
 # One row per DVFS condition (all of FULL_CONDITIONS) on the fixed model+strategy,
@@ -163,7 +180,7 @@ CALIB_GAMMA = 5
 # fitted curve poorly constrained outside that range. The total prompt budget is
 # spread across types instead of concentrated in one.
 CALIB_DATASETS = list(DATASETS)
-CALIB_N_PROMPTS = 128       # TOTAL across CALIB_DATASETS, split as evenly as possible
+CALIB_N_PROMPTS = 64        # TOTAL across CALIB_DATASETS, split as evenly as possible
                             # (64 over 3 types -> 22/21/21). Each prompt yields many
                             # (entropy, alpha) pairs (one per decode step), so the fit
                             # still sees >> CALIB_MIN_PAIRS samples.
@@ -481,8 +498,36 @@ def build_llm(model_pair, strategy, mock=False):
     target = MODEL_PAIRS[model_pair]["target"]
     draft = MODEL_PAIRS[model_pair]["draft"]
     cfg = STRATEGIES[strategy]
-    common = dict(model=target, quantization="bitsandbytes", load_format="bitsandbytes",
-                  dtype="auto", gpu_memory_utilization=0.90, seed=SEED)
+    if USE_BNB_QUANTIZATION:
+        common = dict(model=target, quantization="bitsandbytes", load_format="bitsandbytes",
+                      dtype="auto", gpu_memory_utilization=0.90, seed=SEED)
+    else:
+        # Native bf16 for both target and draft (see USE_BNB_QUANTIZATION comment above
+        # for why bnb is off).
+        #
+        # Confirmed from a real OOM trace: vLLM's memory profiler sizes the KV cache
+        # BEFORE CUDA-graph capture, but graph capture then adds its own ~1.2-1.3GB on
+        # top (captured for many batch-size shapes) — on this 24GB card that pushed
+        # actual usage to ~23.5/23.7GB with zero slack, and the next allocation (inside
+        # the rejection sampler, whose tensor size scales with
+        # batch_size x num_speculative_tokens x vocab_size) had nowhere to go. Fix,
+        # directly addressing each contributor rather than just shrinking one knob:
+        #   enforce_eager=True   -> no CUDA-graph capture, reclaims that ~1.2-1.3GB
+        #                           and removes the riskiest overshoot path (this is
+        #                           vLLM's own suggested remedy in the cudagraph
+        #                           warning text). Applied uniformly to every
+        #                           condition, so the DVFS comparison stays fair.
+        #   max_num_seqs=8        -> directly bounds the rejection-sampler tensor that
+        #                           actually crashed (it scales with concurrent batch
+        #                           size); the default (256) let far too many of a
+        #                           128-prompt calibration batch be scheduled at once.
+        #   max_model_len=2048    -> still generous for GSM8K/HumanEval/CNN-DM prompts
+        #                           + MAX_NEW_TOKENS=256; halves KV-cache-per-sequence
+        #                           footprint vs the previous 4096, giving the
+        #                           scheduler more room before hitting preemption.
+        common = dict(model=target, dtype="auto", gpu_memory_utilization=0.90,
+                      max_model_len=MAX_MODEL_LEN, max_num_seqs=MAX_NUM_SEQS,
+                      enforce_eager=True, seed=SEED)
     if cfg["kind"] == "vanilla":
         return LLM(**common)
     # >>> SEAM: confirm vLLM 0.6.6 speculative_config keys (these are the standard ones).
@@ -611,9 +656,21 @@ def main():
     ap.add_argument("--allow-clock-mismatch", action="store_true")
     ap.add_argument("--recalibrate", action="store_true",
                     help="refit entropy calibration even if calibration/fitted_<pair>.json exists")
+    ap.add_argument("--f-low", type=int, default=None,
+                    help="override F_LOW (the draft-phase clock, MHz) for this run — used to "
+                         "sweep the draft clock and find the energy/latency knee. Snapped to a "
+                         "valid GPU clock level by resolve_clocks.")
+    ap.add_argument("--f-high", type=int, default=None,
+                    help="override F_HIGH (the verify-phase clock, MHz) for this run.")
     args = ap.parse_args()
 
     global F_HIGH, F_LOW
+    # CLI overrides take effect BEFORE resolve_clocks so they get snapped/validated
+    # against the live GPU's clock table exactly like the defaults would be.
+    if args.f_high is not None:
+        F_HIGH = args.f_high
+    if args.f_low is not None:
+        F_LOW = args.f_low
     F_HIGH, F_LOW = resolve_clocks(args.mock, args.allow_clock_mismatch)
     reset_clocks(args.mock)   # clean start: clear any lock left by a prior/crashed run
 
