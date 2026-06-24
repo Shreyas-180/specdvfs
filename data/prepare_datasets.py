@@ -62,14 +62,19 @@ def _save(path: Path, payload: dict) -> None:
 def prepare_gsm8k() -> Path:
     from datasets import load_dataset
     print("gsm8k ...")
-    # Newer huggingface_hub versions require 'namespace/name' format.
-    # If 'gsm8k' (short name) fails on a fresh machine, try 'openai-community/gsm8k'.
-    ds      = load_dataset("gsm8k", "main", split="test")
+    # The dataset moved under a namespace on the Hub; newer huggingface_hub no
+    # longer accepts the old bare 'gsm8k' repo id (HfUriError: 'namespace/name'
+    # required). Confirmed current location: https://huggingface.co/datasets/openai/gsm8k
+    # — same configs ('main' / 'socratic'), same split names, just namespaced.
+    ds      = load_dataset("openai/gsm8k", "main", split="test")
     total   = len(ds)
     indices = _sample_indices(total, N_SMALL, SEED)
     samples = [{"id": i, "dataset_index": idx, "text": ds[idx]["question"]}
                for i, idx in enumerate(indices)]
     payload = {
+        # "dataset" stays the short internal label used throughout the codebase
+        # (matches the DATASETS dict key in experiments/run_experiment.py) — it is
+        # NOT the HF repo id, so it intentionally does not change to "openai/gsm8k".
         "dataset": "gsm8k", "config": "main", "split": "test",
         "seed": SEED, "n_samples": len(samples),
         "total_dataset_size": total, "indices": indices, "samples": samples,
