@@ -19,14 +19,16 @@ Two ways to supply the numbers:
             --draft-flops 1.2e10 --draft-bytes 9.0e9 \
             --verify-flops 4.5e11 --verify-bytes 6.0e9
 
-  (B) From ncu --csv files — best-effort. Sums dram__bytes.sum for bytes and the
-      FP32 instruction counters (fadd + fmul + 2*ffma) for FLOPs:
+  (B) From ncu --csv files — best-effort. Sums dram__bytes.sum for bytes and the FLOP
+      counters for FLOPs: CUDA-core FP (fadd + fmul + 2*ffma) PLUS the tensor-core
+      ops_path_tensor_* metric (bf16 GEMMs live here and dominate — omitting them, as the
+      first attempt did, makes everything look memory-bound). Prefix sm__/smsp__ is matched
+      tolerantly. Request exactly these metrics via ncu --metrics (see prof_roofline.py) so
+      the names in the CSV match what this parser looks for. If your ncu lacks the tensor
+      metric name, the parser says what it found — confirm with `ncu --query-metrics` and
+      either pass the right name or read achieved FLOP/s from SpeedOfLight and use (A).
         python profiling/analyze_roofline.py \
             --draft-csv profiling/out/draft.csv --verify-csv profiling/out/verify.csv
-      If your ncu version/sections don't include those metrics, the parser says so
-      and lists what it found — fall back to (A). NOTE: the FP32 counters under-
-      count bf16/tensor-core math, so if FLOPs look implausibly low, read ncu's own
-      achieved FLOP/s (SpeedOfLight) and use (A).
 
 Override the GPU peaks with --peak-tflops / --peak-bw-gbs (defaults: RTX 3090).
 """
@@ -41,17 +43,38 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# RTX 3090 defaults (same as profiling/roofline.py).
-RTX3090_PEAK_TFLOPS = 35.6
+# RTX 3090 defaults (same as profiling/roofline.py — keep them in sync).
+# 71.0 = bf16 tensor-core peak, FP32 accumulate (matches counting tensor-core FLOPs below).
+RTX3090_PEAK_TFLOPS = 71.0
 RTX3090_PEAK_BW_GBS = 936.0
 
-# ncu metric names (FP32 instruction counters + DRAM traffic).
+# ncu metric names. bf16 LLM math is dominated by tensor-core GEMMs, which the FP32 thread-
+# instruction counters (fadd/fmul/ffma) DO NOT count — counting only those makes every phase
+# look memory-bound (this is exactly why the earlier crashed capture read I~0.08). So
+# FLOPs = CUDA-core FP ops + tensor-core ops. Matching is tolerant of the sm__ vs smsp__
+# aggregation prefix, which differs across ncu versions / how the metric was requested.
 _BYTES_METRIC = "dram__bytes.sum"
-_FLOP_METRICS = {
-    "sm__sass_thread_inst_executed_op_fadd_pred_on.sum": 1.0,
-    "sm__sass_thread_inst_executed_op_fmul_pred_on.sum": 1.0,
-    "sm__sass_thread_inst_executed_op_ffma_pred_on.sum": 2.0,   # FMA = 2 FLOPs
+_PREFIXES = ("smsp__", "sm__")
+# suffix (prefix-stripped) -> FLOPs-per-count multiplier.
+_FLOP_SUFFIXES = {
+    "sass_thread_inst_executed_op_fadd_pred_on.sum": 1.0,   # CUDA-core FP add
+    "sass_thread_inst_executed_op_fmul_pred_on.sum": 1.0,   # CUDA-core FP mul
+    "sass_thread_inst_executed_op_ffma_pred_on.sum": 2.0,   # CUDA-core FMA = 2 FLOPs
+    # tensor-core op metrics are ALREADY FLOP counts (not instructions) -> multiplier 1.0.
+    # The exact src/dst dtype suffix is version-dependent; accept the common bf16/fp16 forms
+    # (we run bf16). Confirm with: ncu --query-metrics | grep ops_path_tensor
+    "ops_path_tensor_src_bf16_dst_fp32.sum": 1.0,
+    "ops_path_tensor_src_fp16_dst_fp32.sum": 1.0,
+    "ops_path_tensor_src_bf16_dst_fp16.sum": 1.0,
+    "ops_path_tensor_src_fp16_dst_fp16.sum": 1.0,
 }
+
+
+def _strip_prefix(name):
+    for p in _PREFIXES:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
 
 
 def ridge_point(peak_tflops, peak_bw_gbs):
@@ -103,9 +126,11 @@ def _parse_ncu_csv(path: Path):
         if name == _BYTES_METRIC:
             byts += val
             saw_bytes_metric = True
-        elif name in _FLOP_METRICS:
-            flops += val * _FLOP_METRICS[name]
-            saw_flop_metric = True
+        else:
+            suffix = _strip_prefix(name)
+            if suffix in _FLOP_SUFFIXES:
+                flops += val * _FLOP_SUFFIXES[suffix]
+                saw_flop_metric = True
     return (flops if saw_flop_metric else None,
             byts if saw_bytes_metric else None,
             seen)
@@ -119,7 +144,8 @@ def _phase_from_csv(label, path_str):
     if flops is None or byts is None:
         missing = []
         if flops is None:
-            missing.append(f"FLOP counters ({', '.join(_FLOP_METRICS)})")
+            missing.append("FLOP counters (CUDA-core fadd/fmul/ffma + a tensor-core "
+                           "ops_path_tensor_* metric)")
         if byts is None:
             missing.append(f"DRAM bytes ({_BYTES_METRIC})")
         print(f"  WARN: could not extract {' and '.join(missing)} from {path.name}.")

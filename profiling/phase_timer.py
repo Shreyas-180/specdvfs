@@ -144,5 +144,5 @@ def install_timing(timer_factory=PhaseTimer):
 #   w = llm.llm_engine.model_executor.driver_worker
 #   w._phase_timer.save("profiling/out/phase_times_gamma5.json")
 #
-# Repeat for gamma in {3,5,7} to see the draft-time fraction grow with gamma — the
+# Repeat across the pilot gammas to see the draft-time fraction grow with gamma — the
 # empirical basis for "savings scale with gamma".

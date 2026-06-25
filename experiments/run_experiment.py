@@ -6,19 +6,24 @@
 
 WHAT THE DELIVERED PATCH SUPPORTS (verified against patch_spec_decode.py):
   The patch wraps draft/verify/_verify_tokens/_run_no_spec and ALWAYS calls
-  on_verify_start(alpha=tracker.estimate). So mechanism-wise it implements exactly:
-      off            -> controller.enabled = False  (hooks no-op; default clock)
-      adaptive_alpha -> controller.enabled = True   (draft f_low; verify = verify_freq(lagging α))
-  These two are wired and run now. The other conditions (fixed_low, two_level, coarse,
-  adaptive_entropy) are kept in the matrix machinery but GUARDED — they each need a small
-  patch extension (see PENDING_CONDITIONS and the patch-extension spec in the handoff).
+  on_verify_start(alpha=tracker.estimate). The per-condition verify policy lives in
+  core.py (mode-aware on_verify_start), so the patch stays condition-agnostic and the
+  controller.mode string selects the behaviour:
+      off              -> controller.enabled = False (hooks no-op; default clock)
+      two_level        -> f_low draft, f_high verify (alpha ignored)
+      adaptive_alpha   -> verify = verify_freq(lagging EMA alpha)
+      adaptive_entropy -> verify = verify_freq(a*exp(b*H)) on the draft's entropy H
+      fixed_low,coarse -> ablations (full-run only)
+  adaptive_entropy additionally requires the draft lm_head entropy hook to fire and a
+  per-pair (a,b) calibration (auto-fit pre-pass); it is the least-tested path, so the
+  pilot checks that its runs actually differ from adaptive_alpha (see the footer USAGE).
 
 CONTROL FLOW (the delivered patch's install() flow, fork-safe):
   install_dvfs() patches SpecDecodeWorker.init_device at the class level ONCE, with a
   factory that builds a DVFSController INSIDE each worker process (so nvmlInit runs there).
   Each LLM build then constructs+wraps a controller; retrieve_controller() fetches it from
-  worker._dvfs_controller (in-process; TP=1 single-GPU). Per run we toggle controller.enabled
-  (off vs adaptive_alpha). Vanilla has no SpecDecodeWorker, so its controller is None.
+  worker._dvfs_controller (in-process; TP=1 single-GPU). Per run we set controller.enabled
+  and controller.mode (configure_dvfs). Vanilla has no SpecDecodeWorker, so controller is None.
 
 THREE SEAMS were resolved by the delivered files:
   build_llm()             — the vLLM 0.6.6 speculative_config (standard SD knobs; confirm).
@@ -51,28 +56,26 @@ F_HIGH = 1935          # confirmed RTX 3090 sustainable-lock ceiling
 F_LOW = 735            # confirmed chosen low level
 SEED = 42
 
-# bitsandbytes is OFF by default: on this stack (vLLM 0.6.6 + Llama-3.2-1B draft),
-# loading the draft model under `load_format="bitsandbytes"` crashes during weight
-# loading (RuntimeError in linear.py's weight_loader narrow() — confirmed by tracing
-# vLLM 0.6.6's own BitsAndBytesModelLoader: load_format is one engine-wide setting,
-# so it's NOT possible to bnb-quantize the target while loading the draft in plain
-# bf16 within a single LLM(...) call; on-the-fly bnb quantization unconditionally
-# runs for every model the engine loads, target AND draft, and the 1B model's
-# checkpoint layout breaks it). Loading both models native bf16 avoids the bug
-# entirely; MAX_MODEL_LEN below keeps KV cache memory small enough to still fit a
-# 24GB GPU. If a later vLLM build fixes the bnb+draft interaction, flip this back on.
-USE_BNB_QUANTIZATION = False
-MAX_MODEL_LEN = 2048   # plenty for GSM8K/HumanEval/CNN-DM prompts + MAX_NEW_TOKENS;
-                       # keeps the bf16 KV cache footprint small on a 24GB GPU.
-MAX_NUM_SEQS = 8       # caps concurrent-batch size; bounds the rejection sampler's
-                       # per-step tensor (scales with batch_size x gamma x vocab_size)
-                       # that caused the OOM seen with the default (256) concurrency.
-
 TEMP_LIMIT_C = 75
 WARMUP_PROMPTS = 5
 COOLDOWN_S = 30
 MONITOR_HZ = 100       # 10 ms NVML sampling
 MAX_NEW_TOKENS = 256
+
+# --- Engine memory fit (bf16, quantization OFF) -------------------------------
+# These are the settings the *successful* pilot actually ran under (handoff:
+# "Both models load in bf16 (quantization OFF)", weights 14.99GiB + KV 3.75GiB +
+# ~2.6 overhead < 23.69GiB usable on the 3090). They are restored here because
+# build_llm() in this file was still on the abandoned bitsandbytes path (see the
+# FAILED-approaches list) and set none of them — i.e. this file as delivered would
+# NOT reproduce the pilot: bnb crashes the 0.6.6 spec-decode draft path, and with
+# no max_model_len / enforce_eager the engine OOMs (CUDA-graph capture after KV
+# sizing; 4096 context). Quantization is NOT required for any pair the study runs
+# (llama_8b_1b pilot; qwen3_8b_0p6b + llama_8b_1b full) — all fit in bf16 at 24GB.
+MAX_MODEL_LEN = 2048   # validated fit; > gsm8k/humaneval prompt + 256 gen. cnndm
+                       # articles can exceed this and are truncated at load (below).
+MAX_NUM_SEQS  = 8      # bounds the spec rejection-sampler tensor (batch x gamma x
+                       # vocab) that OOM'd in _get_recovered_probs at the default.
 
 SAMPLED_DIR = PROJECT_ROOT / "data" / "sampled_indices"
 RESULTS_DIR = PROJECT_ROOT / "results"
@@ -100,10 +103,14 @@ STRATEGIES = {
     "spec_g3": {"kind": "constant", "gamma": 3},
     "spec_g5": {"kind": "constant", "gamma": 5},
     "spec_g7": {"kind": "constant", "gamma": 7},
+    "spec_g12": {"kind": "constant", "gamma": 12},   # added: longer draft -> lower mean alpha
+    "spec_g18": {"kind": "constant", "gamma": 18},   # added: pushes alpha into the responsive band
     "spec_dyn": {"kind": "dynamic", "gamma_max": 7},
     "eagle3": {"kind": "eagle"},   # runs only for pairs with eagle_head set
 }
 SD_STRATEGIES_FULL = ["vanilla", "spec_g3", "spec_g5", "spec_g7", "spec_dyn", "eagle3"]
+# NB: spec_g12/spec_g18 are intentionally NOT in SD_STRATEGIES_FULL — they are a
+# pilot instrument for generating alpha variance, not (yet) part of the full sweep.
 
 # Conditions the patch supports out of the box (lagging-α mechanism in patch_spec_decode.py):
 SUPPORTED_CONDITIONS = ["off", "adaptive_alpha"]
@@ -124,30 +131,93 @@ FULL_CONDITIONS = SUPPORTED_CONDITIONS + PENDING_CONDITIONS
 # baseline). For these, the condition name IS the controller.mode value dispatched in core.py.
 DVFS_MODE_CONDITIONS = [c for c in (SUPPORTED_CONDITIONS + PENDING_CONDITIONS) if c != "off"]
 
-# ---- PILOT (exercise the code that actually differs across DVFS conditions) ----
+# ---- PILOT (alpha variance + all four phase-DVFS policies, incl. the entropy one) ----
 # NOTE: pilot uses the Llama pair, not Qwen3 — vLLM 0.6.6 (pinned for the patch's
 # spec_decode hooks) predates the Qwen3 architecture, so Qwen3 will not load on it.
 # Llama-3.1-8B / 3.2-1B are supported by 0.6.6 (they are GATED — needs HF auth).
 #
-# The pilot's job is to surface bugs/mismatches before the full sweep, so it holds
-# the model AND the SD strategy fixed and sweeps ALL SIX DVFS conditions — that is
-# where the new, least-tested code lives (the mode-aware on_verify_start dispatch,
-# and for adaptive_entropy the entropy lm_head hook + calibration chain). A single
-# vanilla (no-SD) reference is included so energy/latency have a baseline.
+# WHY THE OLD PILOT FAILED TO BE USEFUL.  It fixed (model, strategy, dataset) and swept
+# DVFS conditions only.  But alpha (= num_accepted / num_draft; see metrics_reader) is
+# decided by the accept/reject sequence, which at temp=0/seed=42 is bit-identical across
+# DVFS conditions — DVFS changes clock timing, not computation.  So alpha was a CONSTANT
+# 0.9208 in every cell, >> the mapper's alpha_high=0.7: verify_freq() always returned
+# f_high and every adaptive mode collapsed onto two_level. Nothing to validate.
+#
+# WHAT MOVES ALPHA — and why that matters for BOTH adaptive policies. Not the DVFS
+# condition (it can't) but the accept/reject sequence itself, via:
+#   * draft length gamma — longer drafts propose tokens further out where draft/target
+#     diverge, so mean acceptance falls as gamma grows;
+#   * dataset — code/summarization diverge from the draft more than formulaic math.
+# Sweeping gamma in {5,12,18} x {gsm8k, humaneval, cnndm} spreads alpha from a
+# saturated-high corner (gsm8k, g5) down toward the responsive band (alpha_low=0.3 ..
+# alpha_high=0.7). That spread is what lets adaptive_alpha pull apart from two_level AND
+# what makes adaptive_entropy meaningful (its entropy->alpha map only matters where alpha
+# actually varies). gamma 3 and 7 are dropped vs the prior pilot to keep the 4-condition
+# matrix at a sane size; the three gammas kept still span the alpha range.
+#
+# CONDITIONS — all four phase-DVFS policies, because the entropy policy is a primary
+# thing to validate (per request):
+#   off            — per-cell SD-without-DVFS baseline (what savings_vs_off compares to).
+#   two_level      — static phase-aware: f_low draft, f_high verify (alpha ignored). The
+#                    reference every adaptive policy is judged against.
+#   adaptive_alpha — lagging signal: verify clock = verify_freq(EMA of last iter's alpha).
+#   adaptive_entropy — LEADING signal: verify clock from alpha_hat = a*exp(b*H) on the
+#                    draft's output entropy H, set within the same iteration. Needs the
+#                    per-pair (a,b) fit; calibrate_pairs_if_needed() auto-runs a 'collect'
+#                    pre-pass (DVFS-off) and writes calibration/fitted_llama_8b_1b.json
+#                    before the matrix (GELATO baseline a=1,b=-0.35 if the fit yields none).
+#                    RISK: this is the least-tested path — it depends on the draft lm_head
+#                    entropy hook firing. If last_entropy stays None, core.py degrades it to
+#                    the lagging-alpha path (so it would look like adaptive_alpha). Sanity-
+#                    check the fit JSON exists and that entropy runs differ from alpha runs.
+# Deferred to the full run: fixed_low and coarse (pure granularity/− ablations; they bear
+# on neither "does alpha vary" nor "does the leading signal help").
 PILOT_MODEL = "llama_8b_1b"
-PILOT_STRATEGY = "spec_g5"
-PILOT_DATASET = "gsm8k"
+PILOT_GAMMAS = [5, 12, 18]                             # draft sizes -> the alpha axis
+PILOT_STRATEGIES = [f"spec_g{g}" for g in PILOT_GAMMAS]
+PILOT_DATASETS = ["gsm8k", "humaneval", "cnndm"]       # math / code / summarization
+PILOT_CONDITIONS = ["off", "two_level", "adaptive_alpha", "adaptive_entropy"]
 PILOT_N_PROMPTS = 64
-PILOT_REPS = 3
+PILOT_REPS = 1                                         # unchanged (per request)
 FULL_REPS = 5
 
-# One row per DVFS condition (all of FULL_CONDITIONS) on the fixed model+strategy,
-# plus a vanilla reference. Built from FULL_CONDITIONS so it can never drift out of
-# sync with the set of conditions the controller actually supports.
+# 4 conditions x 3 gammas x 3 datasets + ONE vanilla (no-SD) reference per dataset
+# (vanilla is gamma-independent, so it is not swept over gamma).
+# = 3 vanilla + (4 * 3 * 3) = 3 + 36 = 39 runs at REPS=1 (the f_low sweep below adds more).
 PILOT_MATRIX = (
-    [(PILOT_MODEL, "vanilla", "off", PILOT_DATASET)]   # reference (no SD)
-    + [(PILOT_MODEL, PILOT_STRATEGY, cond, PILOT_DATASET) for cond in FULL_CONDITIONS]
+    [(PILOT_MODEL, "vanilla", "off", ds) for ds in PILOT_DATASETS]
+    + [(PILOT_MODEL, strat, cond, ds)
+       for strat in PILOT_STRATEGIES
+       for ds in PILOT_DATASETS
+       for cond in PILOT_CONDITIONS]
 )
+
+# ---- f_low (draft-clock) sweep: is the draft phase saving no energy because f_low is a
+# bad value? ----------------------------------------------------------------------------
+# The first pilot saw the draft phase give back ~14-16% GPU power but +30-58% wall time ->
+# net-negative energy. A prime suspect is f_low itself: too HIGH and the memory-bound draft
+# barely drops power; too LOW and even a memory-bound kernel becomes core-clock-limited and
+# the draft stretches out, so the time penalty erases the power saving. There is a sweet
+# spot, and 735 MHz may not be it. This sweep finds it empirically.
+#
+# Design (clean isolation of the DRAFT clock): hold ONE cell fixed and run two_level
+# (draft=f_low, verify=f_high) at several f_low values, mutating only mapper.f_low between
+# runs. f_floor (the verify floor = 0.6*f_high) is independent of f_low, and verify runs at
+# f_high throughout, so verify work/energy is ~constant across the sweep — therefore the
+# variation in TOTAL energy is dominated by the draft phase, and the f_low that minimizes
+# total energy is the draft-optimal clock. temp=0/seed=42 => identical tokens => identical
+# draft WORK across the sweep, so only the clock differs. The cell is the highest gamma
+# (largest draft fraction => most sensitive) on the fastest dataset.
+#   * Results go to results/flow_sweep/ (a SIBLING of results/pilot/), so they never enter
+#     the main aggregation (compute_metrics globs results/<mode>/*.json non-recursively).
+#   * 735 is included as the reference point, so the sweep is self-contained.
+# This is a DIAGNOSTIC that informs the f_low for the full run; it does not feed back into
+# the matrix above (those run at the current F_LOW so the four policies stay comparable).
+PILOT_FLOW_SWEEP_STRATEGY = "spec_g18"
+PILOT_FLOW_SWEEP_DATASET = "gsm8k"
+PILOT_FLOW_SWEEP_MHZ = [480, 600, 735, 870, 990]       # snapped to supported levels at runtime
+PILOT_FLOW_SWEEP_N_PROMPTS = 32                        # fewer than the matrix — keep 5 runs quick;
+                                                       # still ample tokens for a stable kWh reading
 
 
 def build_full_matrix():
@@ -180,7 +250,7 @@ CALIB_GAMMA = 5
 # fitted curve poorly constrained outside that range. The total prompt budget is
 # spread across types instead of concentrated in one.
 CALIB_DATASETS = list(DATASETS)
-CALIB_N_PROMPTS = 64        # TOTAL across CALIB_DATASETS, split as evenly as possible
+CALIB_N_PROMPTS = 128       # TOTAL across CALIB_DATASETS, split as evenly as possible
                             # (64 over 3 types -> 22/21/21). Each prompt yields many
                             # (entropy, alpha) pairs (one per decode step), so the fit
                             # still sees >> CALIB_MIN_PAIRS samples.
@@ -237,7 +307,7 @@ def fit_and_save_calibration(model_pair, pairs):
     return result
 
 
-def calibration_prompts(family, mock=False):
+def calibration_prompts(model_pair, mock=False):
     """CALIB_N_PROMPTS prompts total, split as evenly as possible across CALIB_DATASETS
     (e.g. 128 over 3 types -> 43/43/42). Combined into one list — one build_llm/generate
     pass per model pair, not one per dataset, so calibration cost doesn't multiply."""
@@ -246,7 +316,7 @@ def calibration_prompts(family, mock=False):
     prompts = []
     for i, ds in enumerate(CALIB_DATASETS):
         k = base + (1 if i < extra else 0)
-        prompts += load_prompts(ds, family, k, mock=mock)
+        prompts += load_prompts(ds, model_pair, k, mock=mock)
     return prompts
 
 
@@ -258,7 +328,7 @@ def calibrate_pairs_if_needed(matrix, mock=False, recalibrate=False):
         return
     print(f"== AUTO-CALIBRATION for {pairs} ==")
     for mp in pairs:
-        prompts = calibration_prompts(MODEL_PAIRS[mp]["family"], mock=mock)
+        prompts = calibration_prompts(mp, mock=mock)
         llm = build_llm(mp, f"spec_g{CALIB_GAMMA}", mock)
         controller = retrieve_controller(llm, mock)
         got = collect_entropy_pairs(llm, controller, prompts, mock)
@@ -275,20 +345,57 @@ def calibrate_pairs_if_needed(matrix, mock=False, recalibrate=False):
 # PROMPTS
 # =============================================================================
 
-def load_prompts(dataset_key, family, n=None, mock=False):
+# Leave room for generation inside max_model_len. cnndm articles routinely exceed
+# the prompt budget (~1792 tokens after the 256-token reservation at
+# max_model_len=2048), and vLLM 0.6.6 raises "prompt too long" and ABORTS the run
+# rather than truncating — so without this guard the cnndm cells would crash. We
+# truncate the *payload text* (instruction prefix + article), keeping the HEAD,
+# where CNN/DM summary content concentrates; the template's special tokens are
+# preserved. Truncation is deterministic (tokenizer + fixed budget), so the
+# temp=0/seed=42 reproducibility contract is intact. Only ever fires for cnndm;
+# gsm8k/humaneval prompts sit far under budget and pass through unchanged.
+PROMPT_BUDGET_MARGIN = 48   # slack for decode/re-encode drift + chat-template tokens
+
+_TOKENIZER_CACHE = {}
+
+
+def _get_tokenizer(model_pair):
+    tok = _TOKENIZER_CACHE.get(model_pair)
+    if tok is None:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(MODEL_PAIRS[model_pair]["target"])
+        _TOKENIZER_CACHE[model_pair] = tok
+    return tok
+
+
+def _fit_prompt_text(text, tmpl, model_pair):
+    """Truncate `text` (kept head) so tmpl.format(text=...) fits the prompt budget."""
+    tok = _get_tokenizer(model_pair)
+    budget = MAX_MODEL_LEN - MAX_NEW_TOKENS - PROMPT_BUDGET_MARGIN
+    if len(tok(tmpl.format(text=text), add_special_tokens=False)["input_ids"]) <= budget:
+        return text
+    overhead = len(tok(tmpl.format(text=""), add_special_tokens=False)["input_ids"])
+    text_ids = tok(text, add_special_tokens=False)["input_ids"][:max(0, budget - overhead)]
+    return tok.decode(text_ids)
+
+
+def load_prompts(dataset_key, model_pair, n=None, mock=False):
     fname, prefix = DATASETS[dataset_key]
+    family = MODEL_PAIRS[model_pair]["family"]
+    tmpl = PROMPT_TEMPLATES[family]
     path = SAMPLED_DIR / fname
     if mock and not path.exists():
         # Laptop dry-run before datasets are prepared: synthesize prompts so the
         # harness/JSON/resume logic can be validated with no data files present.
-        tmpl = PROMPT_TEMPLATES[family]
         k = n if n is not None else 8
         return [tmpl.format(text=prefix + f"Mock prompt {i} for harness validation.")
                 for i in range(k)]
     data = json.loads(path.read_text(encoding="utf-8"))
     samples = data["samples"][:n] if n is not None else data["samples"]
-    tmpl = PROMPT_TEMPLATES[family]
-    return [tmpl.format(text=prefix + s["text"]) for s in samples]
+    texts = [prefix + s["text"] for s in samples]
+    if not mock:
+        texts = [_fit_prompt_text(t, tmpl, model_pair) for t in texts]
+    return [tmpl.format(text=t) for t in texts]
 
 
 # =============================================================================
@@ -498,36 +605,17 @@ def build_llm(model_pair, strategy, mock=False):
     target = MODEL_PAIRS[model_pair]["target"]
     draft = MODEL_PAIRS[model_pair]["draft"]
     cfg = STRATEGIES[strategy]
-    if USE_BNB_QUANTIZATION:
-        common = dict(model=target, quantization="bitsandbytes", load_format="bitsandbytes",
-                      dtype="auto", gpu_memory_utilization=0.90, seed=SEED)
-    else:
-        # Native bf16 for both target and draft (see USE_BNB_QUANTIZATION comment above
-        # for why bnb is off).
-        #
-        # Confirmed from a real OOM trace: vLLM's memory profiler sizes the KV cache
-        # BEFORE CUDA-graph capture, but graph capture then adds its own ~1.2-1.3GB on
-        # top (captured for many batch-size shapes) — on this 24GB card that pushed
-        # actual usage to ~23.5/23.7GB with zero slack, and the next allocation (inside
-        # the rejection sampler, whose tensor size scales with
-        # batch_size x num_speculative_tokens x vocab_size) had nowhere to go. Fix,
-        # directly addressing each contributor rather than just shrinking one knob:
-        #   enforce_eager=True   -> no CUDA-graph capture, reclaims that ~1.2-1.3GB
-        #                           and removes the riskiest overshoot path (this is
-        #                           vLLM's own suggested remedy in the cudagraph
-        #                           warning text). Applied uniformly to every
-        #                           condition, so the DVFS comparison stays fair.
-        #   max_num_seqs=8        -> directly bounds the rejection-sampler tensor that
-        #                           actually crashed (it scales with concurrent batch
-        #                           size); the default (256) let far too many of a
-        #                           128-prompt calibration batch be scheduled at once.
-        #   max_model_len=2048    -> still generous for GSM8K/HumanEval/CNN-DM prompts
-        #                           + MAX_NEW_TOKENS=256; halves KV-cache-per-sequence
-        #                           footprint vs the previous 4096, giving the
-        #                           scheduler more room before hitting preemption.
-        common = dict(model=target, dtype="auto", gpu_memory_utilization=0.90,
-                      max_model_len=MAX_MODEL_LEN, max_num_seqs=MAX_NUM_SEQS,
-                      enforce_eager=True, seed=SEED)
+    # bf16, quantization OFF (see the FAILED-approaches note in the handoff):
+    #   * bitsandbytes crashes the 0.6.6 spec-decode draft path (load_format is
+    #     engine-wide, so the draft can't be bnb-loaded while the target is bf16, and
+    #     on-the-fly bnb of Llama-3.2-1B's fused gate_up_proj breaks);
+    #   * bf16 fits both models in 24GB, avoids NF4 dequant traffic (cleaner energy +
+    #     roofline), and yields higher alpha than NF4 would.
+    # max_model_len/max_num_seqs/enforce_eager are the knobs that made the pilot fit;
+    # without them the engine OOMs (4096 context; CUDA-graph capture after KV sizing).
+    common = dict(model=target, dtype="bfloat16",
+                  max_model_len=MAX_MODEL_LEN, max_num_seqs=MAX_NUM_SEQS,
+                  enforce_eager=True, gpu_memory_utilization=0.90, seed=SEED)
     if cfg["kind"] == "vanilla":
         return LLM(**common)
     # >>> SEAM: confirm vLLM 0.6.6 speculative_config keys (these are the standard ones).
@@ -592,14 +680,31 @@ def read_alpha_and_tokens(outputs, llm=None, controller=None, mock=False):
 # ONE RUN
 # =============================================================================
 
+def _set_draft_clock(controller, f_low):
+    """Pin the draft-phase clock (mapper.f_low) for this run. f_low is the only thing the
+    sweep varies; mutating it does NOT touch f_floor (verify floor = 0.6*f_high), and the
+    controller is built once per group, so we set this every run (idempotent) to avoid a
+    swept value leaking into a later default-f_low run."""
+    if controller is None:
+        return
+    mapper = getattr(controller, "mapper", None)
+    if mapper is None:
+        return
+    if f_low >= mapper.f_high:
+        raise ValueError(f"f_low {f_low} must be < f_high {mapper.f_high}")
+    mapper.f_low = int(f_low)
+
+
 def run_single(llm, controller, model_pair, strategy, condition, dataset, rep,
-               prompts, out_path, mock=False):
+               prompts, out_path, mock=False, f_low=None):
     print(f"  RUN  {out_path.name}")
     wait_for_temp(mock=mock)
     if WARMUP_PROMPTS and not mock:
         _ = llm.generate(prompts[:WARMUP_PROMPTS], _sampling_params())
 
     configure_dvfs(controller, condition, mock=mock)
+    f_low_used = int(f_low) if f_low is not None else F_LOW
+    _set_draft_clock(controller, f_low_used)   # default F_LOW, or the swept draft clock
 
     monitor = GpuMonitor(mock=mock)
     meter = EnergyMeter(mock=mock)
@@ -617,7 +722,7 @@ def run_single(llm, controller, model_pair, strategy, condition, dataset, rep,
     result = {
         "model_pair": model_pair, "strategy": strategy, "dvfs_condition": condition,
         "dataset": dataset, "rep": rep, "seed": SEED, "n_prompts": len(prompts),
-        "max_new_tokens": MAX_NEW_TOKENS, "f_high": F_HIGH, "f_low": F_LOW,
+        "max_new_tokens": MAX_NEW_TOKENS, "f_high": F_HIGH, "f_low": f_low_used,
         "wall_time_s": wall_s, "total_tokens": total_tokens, "alpha_mean": alpha_mean,
         "energy_kwh": energy, "gpu_monitor": mon,
         "transition_log_summary": _summarize_transitions(controller),
@@ -644,6 +749,91 @@ def _summarize_transitions(controller):
             "freqs_by_phase": {p: sorted(set(f)) for p, f in by_phase.items()}}
 
 
+def _snap_flow_values(values, mock=False):
+    """Snap requested f_low candidates to the GPU's supported graphics clocks (same rule
+    resolve_clocks uses for the anchors) and de-dupe. In mock there is no GPU, so pass
+    through. Returns ints in the original order."""
+    if mock:
+        return [int(v) for v in values]
+    import pynvml as N
+    N.nvmlInit()
+    h = N.nvmlDeviceGetHandleByIndex(0)
+    mem = N.nvmlDeviceGetSupportedMemoryClocks(h)
+    gfx = sorted(N.nvmlDeviceGetSupportedGraphicsClocks(h, mem[0]))
+    N.nvmlShutdown()
+    snap = lambda f: min(gfx, key=lambda g: abs(g - f))
+    out, seen = [], set()
+    for v in values:
+        s = snap(int(v))
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def run_flow_sweep(n_prompts, mock=False):
+    """Draft-clock (f_low) sweep — find the f_low that minimises draft-phase energy.
+
+    Fixed cell (PILOT_FLOW_SWEEP_{STRATEGY,DATASET}), two_level policy, only mapper.f_low
+    varies. Verify stays at f_high, so total-energy variation across the sweep is dominated
+    by the draft phase and the minimum-energy f_low is the draft-optimal clock. Writes to
+    results/flow_sweep/ (a sibling of results/<mode>/, kept out of the main aggregation) and
+    prints a summary sorted by energy. Builds its own LLM (the matrix already tore its down).
+    """
+    mp, strat, ds = PILOT_MODEL, PILOT_FLOW_SWEEP_STRATEGY, PILOT_FLOW_SWEEP_DATASET
+    flows = _snap_flow_values(PILOT_FLOW_SWEEP_MHZ, mock=mock)
+    out_dir = RESULTS_DIR / "flow_sweep"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = {f: out_dir / f"{mp}__{strat}__two_level__{ds}__flow{f}__rep0.json" for f in flows}
+
+    print(f"\n== f_low SWEEP  {mp}/{strat}/{ds}  two_level  f_low(snapped)={flows} ==")
+    if all(p.exists() for p in paths.values()):
+        print(f"   skip (all {len(flows)} sweep runs done)")
+    else:
+        prompts = load_prompts(ds, mp, n_prompts, mock=mock)
+        llm = build_llm(mp, strat, mock)
+        controller = retrieve_controller(llm, mock)
+        if controller is None and not mock:
+            print("   WARN: no controller on the worker — f_low sweep will not actually move "
+                  "the clock (check install()/in-process worker).")
+        try:
+            for f in flows:
+                if paths[f].exists():
+                    print(f"   skip (done): {paths[f].name}")
+                    continue
+                run_single(llm, controller, mp, strat, "two_level", ds, 0,
+                           prompts, paths[f], mock=mock, f_low=f)
+        finally:
+            del llm, controller
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            reset_clocks(mock)
+
+    # Summary: read back the sweep JSONs and rank by energy (the optimum is the min).
+    rows = []
+    for f in flows:
+        try:
+            d = json.loads(paths[f].read_text())
+            rows.append((f, d.get("energy_kwh"), d.get("wall_time_s")))
+        except Exception:
+            continue
+    have = [r for r in rows if r[1] is not None]
+    if have:
+        best = min(have, key=lambda r: r[1])
+        print("   f_low(MHz)  energy_kWh      wall_s   (sorted by energy; * = min)")
+        for f, e, w in sorted(have, key=lambda r: r[1]):
+            star = " *" if f == best[0] else "  "
+            ws = f"{w:8.1f}" if isinstance(w, (int, float)) else f"{str(w):>8}"
+            print(f"  {star}{f:8d}  {e:12.6f}  {ws}")
+        print(f"   -> draft-optimal f_low this cell: {best[0]} MHz "
+              f"(vs current F_LOW={F_LOW}). Re-confirm on a higher-gamma/low-alpha cell "
+              f"before adopting for the full run.")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -656,21 +846,9 @@ def main():
     ap.add_argument("--allow-clock-mismatch", action="store_true")
     ap.add_argument("--recalibrate", action="store_true",
                     help="refit entropy calibration even if calibration/fitted_<pair>.json exists")
-    ap.add_argument("--f-low", type=int, default=None,
-                    help="override F_LOW (the draft-phase clock, MHz) for this run — used to "
-                         "sweep the draft clock and find the energy/latency knee. Snapped to a "
-                         "valid GPU clock level by resolve_clocks.")
-    ap.add_argument("--f-high", type=int, default=None,
-                    help="override F_HIGH (the verify-phase clock, MHz) for this run.")
     args = ap.parse_args()
 
     global F_HIGH, F_LOW
-    # CLI overrides take effect BEFORE resolve_clocks so they get snapped/validated
-    # against the live GPU's clock table exactly like the defaults would be.
-    if args.f_high is not None:
-        F_HIGH = args.f_high
-    if args.f_low is not None:
-        F_LOW = args.f_low
     F_HIGH, F_LOW = resolve_clocks(args.mock, args.allow_clock_mismatch)
     reset_clocks(args.mock)   # clean start: clear any lock left by a prior/crashed run
 
@@ -681,9 +859,12 @@ def main():
     out_dir = RESULTS_DIR / args.mode
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    n_extra = len(PILOT_FLOW_SWEEP_MHZ) if args.mode == "pilot" else 0
     print(f"mode={args.mode}  combos={len(matrix)}  reps={reps}  "
-          f"total_runs={len(matrix) * reps}  mock={args.mock}  f_high={F_HIGH} f_low={F_LOW}")
-    print(f"  active conditions: {FULL_CONDITIONS}")
+          f"matrix_runs={len(matrix) * reps}"
+          + (f"  + {n_extra} f_low-sweep runs = {len(matrix) * reps + n_extra} total" if n_extra else "")
+          + f"  mock={args.mock}  f_high={F_HIGH} f_low={F_LOW}")
+    print(f"  conditions: {PILOT_CONDITIONS if args.mode == 'pilot' else FULL_CONDITIONS}")
 
     install_dvfs(args.mock)   # patch SpecDecodeWorker.init_device once, before any build
     # Entropy auto-calibration: the patch now supports 'collect' mode, so fit α = a·exp(b·H)
@@ -696,7 +877,6 @@ def main():
     try:
         for (mp, strat), group in groupby(matrix, key=lambda x: (x[0], x[1])):
             entries = list(group)
-            family = MODEL_PAIRS[mp]["family"]
             all_paths = [out_dir / f"{mp}__{strat}__{c}__{ds}__rep{r}.json"
                          for (_, _, c, ds) in entries for r in range(reps)]
             if all(p.exists() for p in all_paths):
@@ -709,7 +889,7 @@ def main():
             prompt_cache = {}
             for (_, _, cond, ds) in entries:
                 if ds not in prompt_cache:
-                    prompt_cache[ds] = load_prompts(ds, family, n_prompts, mock=args.mock)
+                    prompt_cache[ds] = load_prompts(ds, mp, n_prompts, mock=args.mock)
                 prompts = prompt_cache[ds]
                 for rep in range(reps):
                     out_path = out_dir / f"{mp}__{strat}__{cond}__{ds}__rep{rep}.json"
@@ -736,6 +916,10 @@ def main():
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+        # After the matrix: the draft-clock (f_low) sweep — pilot only. Its own resume/skip
+        # logic and a sibling output dir keep it independent of the matrix above.
+        if args.mode == "pilot":
+            run_flow_sweep(PILOT_FLOW_SWEEP_N_PROMPTS, mock=args.mock)
         completed = True
     finally:
         reset_clocks(args.mock)
@@ -773,9 +957,25 @@ if __name__ == "__main__":
 #       python experiments/run_experiment.py --mode pilot --mock
 # 1. VM, after setup_vm.sh + the friend's vllm_hooks/ files (patch + dvfs_controller +
 #    metrics_reader) are in place:
-#       python experiments/run_experiment.py --mode pilot
-#    Checks: gpu_monitor.sm_clock_unique_mhz > 1 for adaptive_alpha (clock toggles),
-#    == 1 for off; alpha_mean populated for the SD runs; energy(adaptive) < energy(off)
-#    at ~the same wall time.
+#       python experiments/run_experiment.py --mode pilot   # 39 matrix runs + 5 f_low-sweep
+#    On first run, an entropy calibration pre-pass auto-fits a=exp(b*H) for llama_8b_1b
+#    (adaptive_entropy is in the matrix) and writes calibration/fitted_llama_8b_1b.json.
+#    Primary check #1 (alpha varies): tabulate alpha_mean by (strategy, dataset); it must
+#    fall as gamma grows and reach the responsive band (< 0.7) toward the (cnndm, spec_g18)
+#    corner. If alpha is pinned high everywhere, the adaptive modes are still open-loop.
+#    Primary check #2 (entropy path is live, not degraded): confirm calibration/fitted_*.json
+#    exists, and that adaptive_entropy runs differ from adaptive_alpha runs (clock trace
+#    and/or energy). If they are identical, last_entropy never populated and core.py fell
+#    back to the lagging-alpha path — the entropy lm_head hook isn't firing.
+#    Secondary checks: gpu_monitor.sm_clock_unique_mhz > 1 for the adaptive modes, == 1 for
+#    off; in HIGH-alpha cells the adaptive policies should sit near f_high and in LOW-alpha
+#    cells drop below it (and below two_level) — that divergence is the adaptive logic working.
+#    f_low SWEEP: results/flow_sweep/ holds two_level @ spec_g18/gsm8k across f_low; the run
+#    prints an energy-ranked table and the draft-optimal f_low. If the min is well below the
+#    current F_LOW=735, the draft phase was losing energy to a too-high low-clock — adopt the
+#    swept optimum for the full run (re-confirm on a low-alpha cell first). This is a separate
+#    question from the roofline (which still needs the clean ncu capture).
 # 2. Full sweep (resumable):  python experiments/run_experiment.py --mode full
-# 3. Post-process on the laptop: evaluation/compute_metrics.py -> aggregate -> figures.
+# 3. Post-process on the laptop: evaluation/compute_metrics.py -> aggregate -> figures
+#    (gamma_trend.csv + savings_vs_off.csv are the per-cell outputs this pilot feeds;
+#    the flow_sweep/ dir is analyzed separately — it is intentionally out of that pipeline).

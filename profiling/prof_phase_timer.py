@@ -3,7 +3,7 @@
 
 Runs a short speculative-decoding job with a PhaseTimer attached at the SAME hook
 points the DVFS patch uses (so they can never drift), then dumps draft_ms /
-verify_ms and the verify/draft ratio. Run it for gamma in {3,5,7} to watch the
+verify_ms and the verify/draft ratio. Run it across the pilot gammas to watch the
 draft-time fraction grow with the draft length — the empirical basis for
 "savings scale with gamma".
 
@@ -14,7 +14,7 @@ fairly clock-robust, but locking removes the governor as a confound). Pass
 --no-lock to profile at the default/live clock instead.
 
 Model/build/prompt config is imported from experiments.run_experiment so a
-profiling run uses byte-for-byte the same model, quantization, seed and prompts
+profiling run uses byte-for-byte the same model, dtype (bf16), seed and prompts
 as the measured runs.
 
 USAGE (on the VM, after setup_vm.sh + the clock-lock GO and HF login):
@@ -38,6 +38,10 @@ from experiments.run_experiment import (        # noqa: E402
     MODEL_PAIRS, STRATEGIES, F_HIGH, SEED, build_llm, load_prompts,
 )
 from profiling.phase_timer import install_timing  # noqa: E402
+
+# Constant-gamma SD strategies available (tracks spec_g12/g18 added for the pilot).
+_GAMMA_STRATS = sorted(int(s[len("spec_g"):]) for s in STRATEGIES
+                       if s.startswith("spec_g") and s[len("spec_g"):].isdigit())
 
 OUT_DIR = PROJECT_ROOT / "profiling" / "out"
 
@@ -88,7 +92,8 @@ def main():
     ap = argparse.ArgumentParser(description="Phase-1 per-phase CUDA-event timing")
     ap.add_argument("--model-pair", default="llama_8b_1b", choices=list(MODEL_PAIRS))
     ap.add_argument("--gamma", type=int, default=5,
-                    help="num_speculative_tokens; must map to a spec_g{N} strategy (3, 5 or 7)")
+                    help=f"num_speculative_tokens; must map to a spec_g{{N}} strategy "
+                         f"(one of {_GAMMA_STRATS})")
     ap.add_argument("--dataset", default="gsm8k")
     ap.add_argument("--n-prompts", type=int, default=64)
     ap.add_argument("--max-tokens", type=int, default=128)
@@ -101,9 +106,8 @@ def main():
     strat = f"spec_g{args.gamma}"
     if strat not in STRATEGIES:
         sys.exit(f"--gamma {args.gamma} has no strategy '{strat}'. "
-                 f"Phase timing expects gamma in {{3,5,7}} (the constant-gamma strategies).")
+                 f"Phase timing expects gamma in {_GAMMA_STRATS} (the constant-gamma strategies).")
 
-    family = MODEL_PAIRS[args.model_pair]["family"]
     out = Path(args.out) if args.out else (
         OUT_DIR / f"phase_times_{args.model_pair}_g{args.gamma}.json")
 
@@ -113,7 +117,7 @@ def main():
         install_timing()                          # MUST be before building the LLM
         print(f"  building {args.model_pair} / {strat} ...")
         llm = build_llm(args.model_pair, strat, mock=False)
-        prompts = load_prompts(args.dataset, family, args.n_prompts)
+        prompts = load_prompts(args.dataset, args.model_pair, args.n_prompts)
 
         from vllm import SamplingParams
         print(f"  timing {len(prompts)} prompts x {args.max_tokens} tokens ...")
