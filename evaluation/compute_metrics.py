@@ -79,6 +79,14 @@ def load_runs(results_dir: Path) -> pd.DataFrame:
             "temp_c_max": _g(r, "gpu_monitor", "temp_c_max"),
             "f_high": r.get("f_high"),
             "f_low": r.get("f_low"),
+            # --- ridge-crossing experiment axes (see run_experiment.py) ---
+            # Defaults keep OLD result JSONs (written before these fields existed) loadable:
+            # the 75 pilot runs already on disk ran at batch 8 / 2048 ctx / full 82 SMs, which
+            # is exactly what these fallbacks encode, so old and new rows stay comparable.
+            "batch_size": r.get("batch_size", 8),
+            "max_model_len": r.get("max_model_len", 2048),
+            "sm_count": r.get("sm_count", 82),
+            "sm_total": r.get("sm_total", 82),
         })
     return pd.DataFrame(rows)
 

@@ -12,6 +12,7 @@ Exit code 0 = all critical checks passed (safe to run experiments).
 Exit code 1 = at least one critical check failed (do not commit to this machine).
 """
 
+import shutil          # check 12: locate nvidia-cuda-mps-control
 import sys
 import time
 import subprocess
@@ -298,6 +299,108 @@ def check_temperature(pynvml, h):
 
 # ── 10. vLLM importable at the pinned version ────────────────────────────────
 
+def check_sweep_modules():
+    """11. Modules the ridge-crossing sweeps import (--sweep batch / --sweep sm).
+
+    These are WARN-level, not critical: the main pilot runs fine without them. They only
+    matter if you intend to run the batch or SM sweeps on this machine.
+    """
+    section("11. Ridge-crossing sweep modules")
+    sm = None
+    try:
+        import sm_partition as sm
+        warn("sm_partition importable", True, "repo-root module found")
+    except ImportError:
+        warn("sm_partition importable", False,
+             "MISSING — must sit at the REPO ROOT (beside experiments/, not inside it). "
+             "'--sweep sm' and prof_roofline.py both import it.")
+    try:
+        import gpu_profiles  # noqa: F401
+        warn("gpu_profiles importable", True, "repo-root module found")
+    except ImportError:
+        warn("gpu_profiles importable", False,
+             "MISSING at repo root — analyze_roofline.py imports it for peak TFLOPS/bandwidth.")
+    return sm
+
+
+def check_sm_restriction(pynvml, h, sm_mod):
+    """12. Approach 2 prerequisites: SM count + MPS.
+
+    SM restriction uses CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, which the driver reads ONCE when a
+    CUDA context is created. Without the MPS control daemon running, that variable is SILENTLY
+    IGNORED — every 'SM level' would then run on the full GPU and produce a fake sweep that
+    looks perfectly plausible. This check exists to make that failure loud and early.
+    """
+    section("12. SM restriction (Approach 2, '--sweep sm')")
+    if sm_mod is None:
+        warn("SM restriction usable", False, "sm_partition not importable (see check 11)")
+        return
+    # Report the card's real SM count; the sweep ladder is calibrated for 82 (RTX 3090/GA102).
+    n_sm = None
+    try:
+        n_sm = pynvml.nvmlDeviceGetNumGpuCores(h) // 128   # cores/SM = 128 on Ampere consumer
+    except Exception:
+        try:
+            import torch as _t
+            p = _t.cuda.get_device_properties(0)
+            n_sm = p.multi_processor_count
+        except Exception:
+            pass
+    if n_sm:
+        expected = sm_mod.SM_TOTAL_RTX3090
+        warn(f"SM count = {n_sm}", True,
+             "" if n_sm == expected else
+             f"sweep ladder PILOT_SM_SWEEP_COUNTS is calibrated for {expected} SMs (RTX 3090). "
+             f"On a {n_sm}-SM card, recompute the premise window before trusting the ladder.")
+        lo, hi = sm_mod.premise_window(41.12, 58.53, sm_total=n_sm)
+        print(f"      premise window on THIS card (I_draft=41.1 < I* <= I_verify=58.5): "
+              f"SMs {int(lo)+1}..{int(hi)}  ({(int(lo)+1)/n_sm*100:.0f}%-{int(hi)/n_sm*100:.0f}% of GPU)")
+    else:
+        warn("SM count readable", False, "could not determine SM count from NVML or torch")
+
+    have_ctl = shutil.which("nvidia-cuda-mps-control") is not None
+    warn("nvidia-cuda-mps-control present", have_ctl,
+         "" if have_ctl else "MPS tooling not installed — '--sweep sm' cannot restrict SMs.")
+    if have_ctl:
+        running = sm_mod.mps_daemon_running()
+        warn("MPS daemon running", running,
+             "" if running else
+             "NOT running. Start it BEFORE '--sweep sm':  nvidia-cuda-mps-control -d   "
+             "(without it the thread-percentage cap is silently ignored and every SM level "
+             "would secretly run on the full GPU).")
+
+
+def check_batch_sweep_fit(pynvml, h):
+    """13. Approach 1 prerequisites: does the batch ladder fit this card's KV pool?
+
+    Recomputes the batch-sweep feasibility from THIS GPU's memory rather than trusting the
+    numbers baked into run_experiment.py (which were measured on a 24GB 3090).
+    """
+    section("13. Batch sweep feasibility (Approach 1, '--sweep batch')")
+    # Config mirrored from run_experiment.py; kept in sync deliberately so this check is
+    # meaningful on a machine where the repo has not been edited.
+    batches, mml, gen, margin = [4, 8, 11, 16, 22], 1024, 256, 48
+    prompt_budget = mml - gen - margin
+    warn(f"prompt budget at max_model_len={mml}", prompt_budget > 0,
+         f"{mml} - {gen} (generation) - {margin} (margin) = {prompt_budget} tokens "
+         f"{'(covers gsm8k/humaneval; cnndm excluded by design)' if prompt_budget > 0 else 'INFEASIBLE'}")
+    try:
+        info = pynvml.nvmlDeviceGetMemoryInfo(h)
+        total_gib = info.total / (1024 ** 3)
+    except Exception:
+        warn("VRAM readable", False, "could not query memory")
+        return
+    # KV pool ~= 0.90*total - target weights(14.99) - draft(2.32 loaded after) - overhead(2.63)
+    # Matches the pilot's observed 3.71 GiB pool -> 1517 blocks x 16 = 24,272 token slots.
+    kv_gib = 0.90 * total_gib - 14.99 - 2.41 - 0.22
+    slots = int(kv_gib * (1024 ** 3) / (16 * 160 * 1024)) * 16 if kv_gib > 0 else 0
+    worst = max(batches) * mml
+    ok = slots > 0 and worst <= slots
+    warn(f"KV pool fits batch ladder {batches}", ok,
+         f"~{kv_gib:.2f} GiB pool ~= {slots:,} token slots; worst case "
+         f"{max(batches)}x{mml} = {worst:,} -> {'fits' if ok else 'OVER BUDGET, lower max batch or max_model_len'}")
+
+
 def check_vllm():
     section("10. vLLM")
     try:
@@ -333,6 +436,10 @@ def main():
     check_exclusivity(pynvml, h)
     check_temperature(pynvml, h)
     check_vllm()
+    # Ridge-crossing sweep prerequisites (WARN-level: the main pilot does not need them).
+    sm_mod = check_sweep_modules()
+    check_sm_restriction(pynvml, h, sm_mod)
+    check_batch_sweep_fit(pynvml, h)
 
     _verdict()
 
@@ -367,4 +474,3 @@ if __name__ == "__main__":
 # The decisive checks are #5 (clock lock read-back), #6 (lock survives load),
 # and #7 (power telemetry is real). A machine can pass a naive "does NVML
 # error" test while failing all three of these silently.
-

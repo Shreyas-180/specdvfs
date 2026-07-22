@@ -54,6 +54,23 @@ else
   echo "==> [1/2] no run JSONs under ${RUN_JSON_DIR} — skipping ${MODE} analysis."
 fi
 
+# ---------- ridge-crossing sweeps: batch_sweep / sm_sweep -> their own out dirs ----------
+# Each sweep is a self-contained study in its own results dir, so it gets its own metrics +
+# figures tree rather than being merged into the pilot's. The ridge_sweep_*.png figure only
+# renders when the corresponding axis actually varies, which is exactly when these run.
+for SWEEP in batch sm; do
+  SWEEP_DIR="${PULLED}/results/${SWEEP}_sweep"
+  if [ -d "$SWEEP_DIR" ] && ls "$SWEEP_DIR"/*.json >/dev/null 2>&1; then
+    echo "==> [1b] ${SWEEP} sweep metrics + figures  (from ${SWEEP_DIR})"
+    if "$PYTHON" evaluation/compute_metrics.py   --results-dir "$SWEEP_DIR" \
+    && "$PYTHON" evaluation/generate_figures.py  --runs-csv "evaluation/out/${SWEEP}_sweep/runs.csv"; then
+      echo "    -> evaluation/out/${SWEEP}_sweep/  (runs.csv, figures/ridge_sweep_${SWEEP}.png)"
+    else
+      echo "    !! ${SWEEP} sweep analysis FAILED — see the error above." >&2
+    fi
+  fi
+done
+
 # ---------- roofline: raw ncu CSVs -> intensity + GO/NO-GO verdict + plot -------
 DRAFT="${PULLED}/profiling/out/draft.csv"
 VERIFY="${PULLED}/profiling/out/verify.csv"

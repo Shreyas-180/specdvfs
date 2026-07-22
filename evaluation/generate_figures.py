@@ -162,6 +162,69 @@ def fig_clock_levels(runs: pd.DataFrame, fig_dir: Path):
     _save(fig, fig_dir / "clock_levels_by_condition.png")
 
 
+def fig_ridge_sweep(runs: pd.DataFrame, fig_dir: Path, axis: str):
+    """Energy saving vs the ridge-crossing axis (batch_size or sm_count).
+
+    THE headline figure for both approaches. For each axis level it computes, per DVFS
+    condition, the GPU-energy saving relative to that SAME level's 'off' run — so every point
+    is an apples-to-apples within-level comparison and the axis is the only thing varying.
+    A vertical line marks where verify is predicted to cross the ridge; the question the
+    figure answers is whether the DVFS advantage visibly changes across that line.
+    """
+    col = "batch_size" if axis == "batch" else "sm_count"
+    if col not in runs.columns or runs[col].dropna().nunique() < 2:
+        print(f"  skip ridge_sweep_{axis} (need >=2 distinct {col} values)")
+        return
+    if "gpu_energy_Wh" not in runs.columns:
+        print(f"  skip ridge_sweep_{axis} (no gpu_energy_Wh)")
+        return
+
+    rows = []
+    for (lvl, ds), sub in runs.groupby([col, "dataset"]):
+        off = sub[sub["dvfs_condition"] == "off"]["gpu_energy_Wh"].mean()
+        if not off or pd.isna(off):
+            continue
+        for cond, s2 in sub.groupby("dvfs_condition"):
+            if cond == "off":
+                continue
+            e = s2["gpu_energy_Wh"].mean()
+            if pd.isna(e):
+                continue
+            rows.append({col: lvl, "dataset": ds, "dvfs_condition": cond,
+                         "saving_pct": (off - e) / off * 100.0})
+    if not rows:
+        print(f"  skip ridge_sweep_{axis} (no per-level 'off' baseline to compare against)")
+        return
+    d = pd.DataFrame(rows)
+
+    datasets = sorted(d["dataset"].unique())
+    fig, axes = plt.subplots(1, len(datasets), figsize=(6.0 * len(datasets), 4.4), squeeze=False)
+    for ax, ds in zip(axes[0], datasets):
+        sub = d[d["dataset"] == ds]
+        for cond, s in sub.groupby("dvfs_condition"):
+            s = s.sort_values(col)
+            ax.plot(s[col], s["saving_pct"], marker="o", label=cond)
+        ax.axhline(0, color="black", linewidth=0.8)
+        if axis == "batch":
+            # I_verify = 58.5 x (batch x 19)/152 crosses I*=75.9 between batch 8 and 11
+            ax.axvline(11, ls="--", color="crimson", linewidth=1.2,
+                       label="predicted ridge crossing")
+            ax.set_xlabel("MAX_NUM_SEQS (batch size)  ->  I_verify rises")
+        else:
+            # premise window from measured intensities: 45 <= SMs <= 63
+            ax.axvspan(45, 63, color="mediumseagreen", alpha=0.15,
+                       label="predicted premise window")
+            ax.set_xlabel("SMs available  ->  ridge I* falls")
+            ax.invert_xaxis()
+        ax.set_ylabel("GPU energy saved vs 'off' at the SAME level (%)")
+        ax.set_title(ds)
+        ax.legend(fontsize=8)
+    fig.suptitle("Approach 1: does DVFS help more once verify goes compute-bound?"
+                 if axis == "batch" else
+                 "Approach 2: does DVFS help more inside the premise window?")
+    _save(fig, fig_dir / f"ridge_sweep_{axis}.png")
+
+
 def _maybe(path: Path):
     return pd.read_csv(path) if path.exists() else None
 
@@ -191,6 +254,10 @@ def main():
     fig_energy_vs_latency(savings_off, fig_dir)
     fig_wh_per_1k(runs, fig_dir)
     fig_clock_levels(runs, fig_dir)
+    # Ridge-crossing sweeps: both no-op unless the corresponding axis actually varies in the
+    # data, so this is safe to call for the ordinary pilot too.
+    fig_ridge_sweep(runs, fig_dir, "batch")
+    fig_ridge_sweep(runs, fig_dir, "sm")
     print(f"figures in {fig_dir}")
 
 

@@ -75,6 +75,18 @@ _GAMMA_STRATS = sorted(int(s[len("spec_g"):]) for s in STRATEGIES
                        if s.startswith("spec_g") and s[len("spec_g"):].isdigit())
 
 
+def _active_sm():
+    """SM count this capture is actually running under (None = unrestricted).
+
+    Read from the environment, not from a flag, so it reports what the PROCESS really got.
+    """
+    try:
+        import sm_partition
+        return sm_partition.active_sm_count()
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Phase-1 roofline NVTX driver (run under ncu)")
     ap.add_argument("--model-pair", default="llama_8b_1b", choices=list(MODEL_PAIRS))
@@ -89,6 +101,20 @@ def main():
     # full-length generate).
     ap.add_argument("--n-prompts", type=int, default=1, help="keep tiny — ncu replays kernels")
     ap.add_argument("--max-tokens", type=int, default=8, help="keep tiny — ncu replays kernels")
+    # ---- ridge-crossing experiment knobs (must MATCH the sweep cell being profiled) ----
+    # The measured arithmetic intensity is only meaningful for the configuration it was
+    # captured under, so the roofline capture has to be reproducible at each sweep point.
+    ap.add_argument("--max-num-seqs", type=int, default=None,
+                    help="APPROACH 1: batch size for this capture. I_verify scales with "
+                         "batch x (gamma+1) tokens per verify pass, so this is THE knob that "
+                         "moves verify across the ridge. Match the batch-sweep level.")
+    ap.add_argument("--max-model-len", type=int, default=None,
+                    help="context length; the batch sweep runs at 1024, the main pilot at 2048")
+    ap.add_argument("--sm-count", type=int, default=None,
+                    help="APPROACH 2: informational only here — SM restriction is applied by "
+                         "the MPS env var on the PROCESS (run under the same env as the sweep "
+                         "child), not by this flag. Pass the same N to analyze_roofline.py, "
+                         "which uses it to scale peak FLOPS and move the ridge.")
     ap.add_argument("--flops-sanity", action="store_true",
                     help="skip ncu path; run torch.profiler whole-run FLOP estimate instead")
     ap.add_argument("--selftest", action="store_true",
@@ -103,11 +129,25 @@ def main():
         sys.exit(f"--gamma {args.gamma} has no strategy '{strat}'. Expected one of {_GAMMA_STRATS}.")
 
     install_roofline()                            # MUST be before building the LLM
-    print(f"  building {args.model_pair} / {strat} ...", file=sys.stderr)
-    llm = build_llm(args.model_pair, strat, mock=False)
+    _bs = args.max_num_seqs
+    _mml = args.max_model_len
+    sm_env = _active_sm()
+    print(f"  building {args.model_pair} / {strat} "
+          f"(max_num_seqs={_bs if _bs else 'default'}, max_model_len={_mml if _mml else 'default'}, "
+          f"SMs={sm_env if sm_env else 'unrestricted'}) ...", file=sys.stderr)
+    if args.sm_count is not None and sm_env is not None and int(args.sm_count) != int(sm_env):
+        # Catch the easy mistake: asking for an SM level but forgetting to launch under the
+        # MPS-capped environment. The capture would then silently profile the FULL GPU.
+        print(f"  !! --sm-count {args.sm_count} but the process is actually running with "
+              f"SMs={sm_env}. Launch this capture under the same env as the sweep child "
+              f"(CUDA_MPS_ACTIVE_THREAD_PERCENTAGE), or the numbers are for the full GPU.",
+              file=sys.stderr)
+    llm = build_llm(args.model_pair, strat, mock=False,
+                    max_num_seqs=_bs, max_model_len=_mml)
     # NB build_llm sets enforce_eager=True (no CUDA graphs) — required for ncu, which
     # cannot replay graph-captured kernels (a graph build is a classic ncu hang).
-    prompts = load_prompts(args.dataset, args.model_pair, args.n_prompts)
+    prompts = load_prompts(args.dataset, args.model_pair, args.n_prompts,
+                           max_model_len=_mml)
 
     if args.flops_sanity:
         from profiling.roofline import quick_total_flops

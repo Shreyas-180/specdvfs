@@ -36,6 +36,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import subprocess          # run_sm_sweep: one child process per SM level (MPS env is
+                           # read at CUDA-context creation, so it can't change in-process)
 import sys
 import threading
 import time
@@ -47,6 +49,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.prepare_datasets import PROMPT_TEMPLATES, CNN_DM_PREFIX  # noqa: E402
+import sm_partition  # noqa: E402  (repo-root module; Approach 2 — SM restriction)
 
 # =============================================================================
 # CONFIG
@@ -76,6 +79,20 @@ MAX_MODEL_LEN = 2048   # validated fit; > gsm8k/humaneval prompt + 256 gen. cnnd
                        # articles can exceed this and are truncated at load (below).
 MAX_NUM_SEQS  = 8      # bounds the spec rejection-sampler tensor (batch x gamma x
                        # vocab) that OOM'd in _get_recovered_probs at the default.
+# NOTE: both of the above are DEFAULTS only. They are overridable per-run (--max-num-seqs /
+# --max-model-len, and per-cell by the batch sweep) because MAX_NUM_SEQS is the instrument
+# for Approach 1 — see the PILOT_BATCH_SWEEP block. MAX_NUM_SEQS is a SCHEDULER cap: raising
+# it allocates no extra VRAM, it only allows more sequences to be resident at once. The real
+# constraint is total KV slots (below), not this number.
+
+# --- KV budget (from the pilot's own vLLM log; used to bound the batch sweep) --------------
+# vLLM reported: 1517 GPU blocks x block_size 16 = 24,272 token slots, and "Maximum
+# concurrency for 2048 tokens per request: 11.85x" — i.e. the engine itself states only ~11.8
+# full-2048-context sequences fit at once. That number is an INDEPENDENT confirmation of the
+# batch ceiling the sweep is built around, and it is why the sweep drops max_model_len to
+# 1024: at 1024 ctx the ceiling rises to 23.7x, so batch 22 fits even in the worst case
+# (every sequence simultaneously at full context).
+KV_TOTAL_TOKEN_SLOTS = 24272
 
 SAMPLED_DIR = PROJECT_ROOT / "data" / "sampled_indices"
 RESULTS_DIR = PROJECT_ROOT / "results"
@@ -246,6 +263,66 @@ PILOT_FLOW_SWEEP_MHZ = [480, 600, 735, 870, 990]       # snapped to supported le
 PILOT_FLOW_SWEEP_N_PROMPTS = 32                        # fewer than the matrix — keep 5 runs quick;
                                                        # still ample tokens for a stable kWh reading
 
+# =============================================================================
+# THE TWO RIDGE-CROSSING EXPERIMENTS (both answer the SAME question, two ways)
+# =============================================================================
+# The pilot's roofline was NO-GO: ridge I*=75.9, but measured draft I=41.1 and verify I=58.5
+# — both memory-bound, so per-phase DVFS had no clean hardware justification. There are
+# exactly two ways to make  I_draft < I* <= I_verify  true, and this file supports both from
+# one codebase, selected by --sweep:
+#
+#   --sweep batch : move I_verify UP past a fixed ridge, by raising the batch size.
+#                   I_verify scales with tokens per verify pass (batch x (gamma+1)), because
+#                   more sequences amortise the same weight-matrix reads over more FLOPs.
+#                   DEPLOYMENT-REALISTIC: batch size is a knob real serving stacks turn.
+#
+#   --sweep sm    : move the ridge DOWN past a fixed I_verify, by restricting SMs.
+#                   I*(N) = (peak_TFLOPS x N/82) / BW. Phase intensities are unchanged (same
+#                   kernels, same FLOPs, same bytes); only machine balance moves.
+#                   NOT deployment-realistic — it is a controlled instrument for asking "IF
+#                   the premise held, would DVFS help more?" Report it as such.
+#
+# Both write to their own results/<name>_sweep/ dir (siblings of results/pilot/, so they never
+# enter the main aggregation, exactly like flow_sweep) and both reuse run_single() unchanged.
+
+# ---- Approach 1: BATCH-SIZE sweep -------------------------------------------------------
+# gamma is FIXED at 18 because that is the only gamma whose ridge-crossing batch fits in
+# 24GB: at gamma=18 verify scores 19 tokens/seq, so ~11 seqs crosses I*=75.9. At gamma=5 it
+# scores 6, needing ~33 seqs — reachable only at short context (see RUNBOOK caveat).
+# max_model_len is held FIXED across all batch levels ON PURPOSE: letting it vary with batch
+# would change cnndm's truncation point per level, confounding batch against workload. Fixed
+# 1024 gives a 720-token prompt budget (1024 - 256 gen - 48 margin), which covers gsm8k and
+# humaneval untruncated; cnndm is excluded from the default sweep for that reason.
+PILOT_BATCH_SWEEP_STRATEGY = "spec_g18"
+PILOT_BATCH_SWEEP_DATASETS = ["gsm8k", "humaneval"]
+PILOT_BATCH_SWEEP_CONDITIONS = ["off", "two_level", "adaptive_alpha", "adaptive_entropy"]
+PILOT_BATCH_SWEEP_SIZES = [4, 8, 11, 16, 22]   # 2 below the ridge, 3 above (see table below)
+PILOT_BATCH_SWEEP_MAX_MODEL_LEN = 1024         # fixed; 22 x 1024 = 22,528 <= 24,272 KV slots
+PILOT_BATCH_SWEEP_N_PROMPTS = 32
+#   predicted I_verify = 58.5 x (batch x 19) / 152 :
+#     batch= 4 -> I= 29.3  memory-bound        batch=16 -> I=117.1  COMPUTE-bound
+#     batch= 8 -> I= 58.5  memory-bound (=pilot)  batch=22 -> I=161.0  COMPUTE-bound
+#     batch=11 -> I= 80.5  COMPUTE-bound  <- predicted crossing, between 8 and 11
+
+# ---- Approach 2: SM-RESTRICTION sweep ---------------------------------------------------
+# The premise window is BOUNDED ON BOTH SIDES — this is the key design fact. Too few SMs and
+# the DRAFT also becomes compute-bound, breaking the premise the other way:
+#     N=82 (100%) I*=75.9  draft mem  / verify mem      <- reproduces the pilot's NO-GO
+#     N=64  (78%) I*=59.2  draft mem  / verify mem      (marginal, just outside)
+#     N=56  (68%) I*=51.8  draft mem  / verify COMPUTE  <- PREMISE HOLDS
+#     N=48  (59%) I*=44.4  draft mem  / verify COMPUTE  <- PREMISE HOLDS
+#     N=40  (49%) I*=37.0  draft COMPUTE / verify COMPUTE  <- broken the OTHER way
+# so the ladder deliberately brackets the window rather than sitting inside it.
+# Each level needs its OWN PROCESS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE is read once, when the
+# CUDA context is created, so it cannot be changed in-process. run_sm_sweep() therefore
+# re-invokes this script per level (see --_sm-child).
+PILOT_SM_SWEEP_STRATEGY = "spec_g18"
+PILOT_SM_SWEEP_DATASETS = ["gsm8k"]
+PILOT_SM_SWEEP_CONDITIONS = ["off", "two_level", "adaptive_alpha", "adaptive_entropy"]
+PILOT_SM_SWEEP_COUNTS = [82, 64, 56, 48, 40]   # full, marginal, IN-window, IN-window, past it
+PILOT_SM_SWEEP_N_PROMPTS = 32
+SM_TOTAL = sm_partition.SM_TOTAL_RTX3090       # 82 on the RTX 3090 (GA102)
+
 
 def build_full_matrix():
     combos = []
@@ -395,10 +472,21 @@ def _get_tokenizer(model_pair):
     return tok
 
 
-def _fit_prompt_text(text, tmpl, model_pair):
-    """Truncate `text` (kept head) so tmpl.format(text=...) fits the prompt budget."""
+def _fit_prompt_text(text, tmpl, model_pair, max_model_len=None):
+    """Truncate `text` (kept head) so tmpl.format(text=...) fits the prompt budget.
+
+    max_model_len is a parameter (not the global) because the batch sweep runs at a SHORTER
+    context (1024) than the main matrix (2048); using the global there would build prompts too
+    long for the engine and vLLM 0.6.6 ABORTS on an over-length prompt rather than truncating.
+    """
     tok = _get_tokenizer(model_pair)
-    budget = MAX_MODEL_LEN - MAX_NEW_TOKENS - PROMPT_BUDGET_MARGIN
+    mml = MAX_MODEL_LEN if max_model_len is None else int(max_model_len)
+    budget = mml - MAX_NEW_TOKENS - PROMPT_BUDGET_MARGIN
+    if budget <= 0:
+        raise ValueError(
+            f"max_model_len={mml} leaves no prompt budget: {mml} - {MAX_NEW_TOKENS} (generation) "
+            f"- {PROMPT_BUDGET_MARGIN} (margin) = {budget}. Raise max_model_len above "
+            f"{MAX_NEW_TOKENS + PROMPT_BUDGET_MARGIN}.")
     if len(tok(tmpl.format(text=text), add_special_tokens=False)["input_ids"]) <= budget:
         return text
     overhead = len(tok(tmpl.format(text=""), add_special_tokens=False)["input_ids"])
@@ -406,7 +494,7 @@ def _fit_prompt_text(text, tmpl, model_pair):
     return tok.decode(text_ids)
 
 
-def load_prompts(dataset_key, model_pair, n=None, mock=False):
+def load_prompts(dataset_key, model_pair, n=None, mock=False, max_model_len=None):
     fname, prefix = DATASETS[dataset_key]
     family = MODEL_PAIRS[model_pair]["family"]
     tmpl = PROMPT_TEMPLATES[family]
@@ -421,7 +509,7 @@ def load_prompts(dataset_key, model_pair, n=None, mock=False):
     samples = data["samples"][:n] if n is not None else data["samples"]
     texts = [prefix + s["text"] for s in samples]
     if not mock:
-        texts = [_fit_prompt_text(t, tmpl, model_pair) for t in texts]
+        texts = [_fit_prompt_text(t, tmpl, model_pair, max_model_len) for t in texts]
     return [tmpl.format(text=t) for t in texts]
 
 
@@ -625,10 +713,15 @@ class _MockLLM:
         return [_Out() for _ in prompts]
 
 
-def build_llm(model_pair, strategy, mock=False):
+def build_llm(model_pair, strategy, mock=False, max_num_seqs=None, max_model_len=None):
+    """Build the engine. max_num_seqs / max_model_len default to the module constants but are
+    overridable per-build: the batch sweep (Approach 1) varies max_num_seqs, and lowers
+    max_model_len so the larger batch still fits the fixed KV pool."""
     if mock:
         return _MockLLM()
     from vllm import LLM
+    max_num_seqs = MAX_NUM_SEQS if max_num_seqs is None else int(max_num_seqs)
+    max_model_len = MAX_MODEL_LEN if max_model_len is None else int(max_model_len)
     target = MODEL_PAIRS[model_pair]["target"]
     draft = MODEL_PAIRS[model_pair]["draft"]
     cfg = STRATEGIES[strategy]
@@ -641,7 +734,7 @@ def build_llm(model_pair, strategy, mock=False):
     # max_model_len/max_num_seqs/enforce_eager are the knobs that made the pilot fit;
     # without them the engine OOMs (4096 context; CUDA-graph capture after KV sizing).
     common = dict(model=target, dtype="bfloat16",
-                  max_model_len=MAX_MODEL_LEN, max_num_seqs=MAX_NUM_SEQS,
+                  max_model_len=max_model_len, max_num_seqs=max_num_seqs,
                   enforce_eager=True, gpu_memory_utilization=0.90, seed=SEED)
     if cfg["kind"] == "vanilla":
         return LLM(**common)
@@ -723,7 +816,8 @@ def _set_draft_clock(controller, f_low):
 
 
 def run_single(llm, controller, model_pair, strategy, condition, dataset, rep,
-               prompts, out_path, mock=False, f_low=None):
+               prompts, out_path, mock=False, f_low=None,
+               batch_size=None, max_model_len=None):
     print(f"  RUN  {out_path.name}")
     wait_for_temp(mock=mock)
     if WARMUP_PROMPTS and not mock:
@@ -750,6 +844,14 @@ def run_single(llm, controller, model_pair, strategy, condition, dataset, rep,
         "model_pair": model_pair, "strategy": strategy, "dvfs_condition": condition,
         "dataset": dataset, "rep": rep, "seed": SEED, "n_prompts": len(prompts),
         "max_new_tokens": MAX_NEW_TOKENS, "f_high": F_HIGH, "f_low": f_low_used,
+        # --- ridge-crossing experiment axes (recorded on EVERY run, sweep or not, so the
+        # main pilot rows are directly comparable against sweep rows) ---
+        # sm_count is read from the live environment rather than passed in, so it reflects
+        # what this PROCESS actually got (MPS is set at process launch), not an intention.
+        "batch_size": int(batch_size) if batch_size is not None else MAX_NUM_SEQS,
+        "max_model_len": int(max_model_len) if max_model_len is not None else MAX_MODEL_LEN,
+        "sm_count": sm_partition.active_sm_count(SM_TOTAL) or SM_TOTAL,
+        "sm_total": SM_TOTAL,
         "wall_time_s": wall_s, "total_tokens": total_tokens, "alpha_mean": alpha_mean,
         "energy_kwh": energy, "gpu_monitor": mon,
         "transition_log_summary": _summarize_transitions(controller),
@@ -866,6 +968,245 @@ def run_flow_sweep(n_prompts, mock=False):
 
 
 # =============================================================================
+# RIDGE-CROSSING SWEEPS (Approach 1: batch size / Approach 2: SM restriction)
+# =============================================================================
+
+def _sweep_summary(rows, axis_name, extra_note=""):
+    """Shared energy-ranked summary for both sweeps (same shape as run_flow_sweep's).
+
+    Reads energy_kwh as a DICT ({"total_kwh",...}) — the same schema fix run_flow_sweep needed;
+    comparing the dict itself raises TypeError on the min()/sorted() below.
+    """
+    have = [r for r in rows if r[1] is not None]
+    if not have:
+        print("   (no readable results to summarise)")
+        return
+    print(f"   {axis_name:>10}  {'cond':<17}{'gpu_kWh':>11}  {'wall_s':>8}  {'tok/s':>8}")
+    for a, e, w, cond, tok in sorted(have, key=lambda r: (r[0], r[3])):
+        ws = f"{w:8.1f}" if isinstance(w, (int, float)) else f"{str(w):>8}"
+        ts = f"{tok/w:8.1f}" if isinstance(w, (int, float)) and w and tok else f"{'-':>8}"
+        print(f"   {a:>10}  {cond:<17}{e:11.6f}  {ws}  {ts}")
+    if extra_note:
+        print(extra_note)
+
+
+def _read_sweep_rows(paths_by_axis):
+    rows = []
+    for a, p in paths_by_axis.items():
+        try:
+            d = json.loads(p.read_text())
+            rows.append((a, (d.get("energy_kwh") or {}).get("gpu_kwh"),
+                         d.get("wall_time_s"), d.get("dvfs_condition"),
+                         d.get("total_tokens")))
+        except Exception:
+            continue
+    return rows
+
+
+def run_batch_sweep(mock=False):
+    """APPROACH 1 — sweep MAX_NUM_SEQS to push verify's arithmetic intensity past the ridge.
+
+    Fixed cell (gamma=18, per-dataset), fixed max_model_len, all four DVFS conditions at each
+    batch level. Raising batch raises tokens-per-verify-pass, which raises I_verify (the same
+    weight bytes are amortised over more FLOPs) while I_draft barely moves — so the phases
+    separate across the ridge WITHOUT touching the hardware. That is what makes this the
+    deployment-realistic of the two approaches: batch size is a knob real servers turn.
+
+    One engine build per batch level (max_num_seqs is a construction-time argument), then all
+    conditions x datasets run inside that build. Resumable per file, like the matrix.
+    """
+    strat = PILOT_BATCH_SWEEP_STRATEGY
+    mml = PILOT_BATCH_SWEEP_MAX_MODEL_LEN
+    mp = PILOT_MODEL
+    out_dir = RESULTS_DIR / "batch_sweep"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n== BATCH SWEEP  {mp}/{strat}  max_model_len={mml}  "
+          f"batches={PILOT_BATCH_SWEEP_SIZES}  datasets={PILOT_BATCH_SWEEP_DATASETS} ==")
+    print(f"   KV budget: {KV_TOTAL_TOKEN_SLOTS:,} token slots; worst case at batch "
+          f"{max(PILOT_BATCH_SWEEP_SIZES)} x {mml} = "
+          f"{max(PILOT_BATCH_SWEEP_SIZES)*mml:,} -> "
+          f"{'fits' if max(PILOT_BATCH_SWEEP_SIZES)*mml <= KV_TOTAL_TOKEN_SLOTS else 'OVER BUDGET'}")
+
+    def path_for(bs, cond, ds):
+        return out_dir / f"{mp}__{strat}__{cond}__{ds}__bs{bs}__rep0.json"
+
+    for bs in PILOT_BATCH_SWEEP_SIZES:
+        cells = [(cond, ds) for ds in PILOT_BATCH_SWEEP_DATASETS
+                 for cond in PILOT_BATCH_SWEEP_CONDITIONS]
+        if all(path_for(bs, c, d).exists() for c, d in cells):
+            print(f"   skip batch={bs} (all {len(cells)} runs done)")
+            continue
+        print(f"   -- batch={bs}  (predicted I_verify ~ "
+              f"{58.53 * (bs * 19) / 152.0:.0f} FLOPs/byte vs ridge 75.9) --")
+        llm = build_llm(mp, strat, mock, max_num_seqs=bs, max_model_len=mml)
+        controller = retrieve_controller(llm, mock)
+        if controller is not None:
+            controller.entropy_a, controller.entropy_b = entropy_coeffs_for(mp)
+        if controller is None and not mock:
+            print("   WARN: no controller on the worker — DVFS conditions will be inactive.")
+        try:
+            prompt_cache = {}
+            for cond, ds in cells:
+                p = path_for(bs, cond, ds)
+                if p.exists():
+                    print(f"   skip (done): {p.name}")
+                    continue
+                if ds not in prompt_cache:
+                    prompt_cache[ds] = load_prompts(ds, mp, PILOT_BATCH_SWEEP_N_PROMPTS,
+                                                    mock=mock, max_model_len=mml)
+                run_single(llm, controller, mp, strat, cond, ds, 0, prompt_cache[ds], p,
+                           mock=mock, batch_size=bs, max_model_len=mml)
+        finally:
+            del llm, controller
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            reset_clocks(mock)
+
+    paths = {}
+    for bs in PILOT_BATCH_SWEEP_SIZES:
+        for ds in PILOT_BATCH_SWEEP_DATASETS:
+            for cond in PILOT_BATCH_SWEEP_CONDITIONS:
+                p = path_for(bs, cond, ds)
+                if p.exists():
+                    paths[(bs, cond, ds)] = p
+    rows = []
+    for (bs, cond, ds), p in paths.items():
+        try:
+            d = json.loads(p.read_text())
+            rows.append((bs, (d.get("energy_kwh") or {}).get("gpu_kwh"),
+                         d.get("wall_time_s"), f"{cond}/{ds}", d.get("total_tokens")))
+        except Exception:
+            continue
+    print("\n   === batch sweep summary (GPU energy; compare conditions WITHIN a batch) ===")
+    _sweep_summary(rows, "batch",
+                   "   -> Next: re-capture the roofline at each batch level and check WHERE\n"
+                   "      verify actually crosses (predicted between 8 and 11):\n"
+                   "         python profiling/prof_roofline.py --gamma 18 --max-num-seqs <B> \\\n"
+                   "             --max-model-len 1024 --selftest      (then the ncu commands)")
+
+
+def run_sm_sweep(mock=False, only_sm=None):
+    """APPROACH 2 — restrict SMs so the RIDGE falls through the fixed phase intensities.
+
+    Two-level design, forced by how MPS works:
+      * PARENT (only_sm=None): loops the SM ladder and re-invokes THIS SCRIPT once per level
+        as a child process, with CUDA_MPS_ACTIVE_THREAD_PERCENTAGE set in the child's env.
+        A subprocess per level is REQUIRED, not a stylistic choice: the driver reads that
+        variable when the CUDA context is created, so it cannot be changed in-process.
+      * CHILD (only_sm=N): runs the cells for exactly one SM level in its own CUDA context.
+
+    The parent refuses to run if the MPS daemon is down, because without it the percentage is
+    silently ignored and all five "levels" would be identical full-GPU runs that merely look
+    like a sweep.
+    """
+    strat, mp = PILOT_SM_SWEEP_STRATEGY, PILOT_MODEL
+    out_dir = RESULTS_DIR / "sm_sweep"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def path_for(sm, cond, ds):
+        return out_dir / f"{mp}__{strat}__{cond}__{ds}__sm{sm}__rep0.json"
+
+    # ---------------- CHILD: one SM level, inside its own CUDA context ----------------
+    if only_sm is not None:
+        sm = int(only_sm)
+        eff = sm_partition.active_sm_count(SM_TOTAL) or SM_TOTAL
+        print(f"   [sm={sm}] child process; env-reported effective SMs={eff}; "
+              f"predicted ridge I*={sm_partition.ridge_point(sm, sm_total=SM_TOTAL):.1f}")
+        cells = [(cond, ds) for ds in PILOT_SM_SWEEP_DATASETS
+                 for cond in PILOT_SM_SWEEP_CONDITIONS]
+        if all(path_for(sm, c, d).exists() for c, d in cells):
+            print(f"   [sm={sm}] skip (all {len(cells)} runs done)")
+            return
+        install_dvfs(mock)
+        llm = build_llm(mp, strat, mock)
+        controller = retrieve_controller(llm, mock)
+        if controller is not None:
+            controller.entropy_a, controller.entropy_b = entropy_coeffs_for(mp)
+        try:
+            prompt_cache = {}
+            for cond, ds in cells:
+                p = path_for(sm, cond, ds)
+                if p.exists():
+                    print(f"   [sm={sm}] skip (done): {p.name}")
+                    continue
+                if ds not in prompt_cache:
+                    prompt_cache[ds] = load_prompts(ds, mp, PILOT_SM_SWEEP_N_PROMPTS, mock=mock)
+                run_single(llm, controller, mp, strat, cond, ds, 0, prompt_cache[ds], p,
+                           mock=mock)
+        finally:
+            del llm, controller
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            reset_clocks(mock)
+        return
+
+    # ---------------- PARENT: drive one child per SM level ----------------
+    lo, hi = sm_partition.premise_window(41.12, 58.53, sm_total=SM_TOTAL)
+    print(f"\n== SM SWEEP  {mp}/{strat}  counts={PILOT_SM_SWEEP_COUNTS} of {SM_TOTAL} ==")
+    print(f"   premise window (measured I_draft=41.1 < I* <= I_verify=58.5): "
+          f"SMs in [{int(lo)+1}..{int(hi)}]  ({(int(lo)+1)/SM_TOTAL*100:.0f}%-{int(hi)/SM_TOTAL*100:.0f}% of GPU)")
+    for n in PILOT_SM_SWEEP_COUNTS:
+        r = sm_partition.ridge_point(n, sm_total=SM_TOTAL)
+        holds = 41.12 < r <= 58.53
+        print(f"     {n:>3} SMs ({n/SM_TOTAL*100:>3.0f}%)  predicted I*={r:5.1f}  "
+              f"{'PREMISE HOLDS' if holds else ('both compute-bound' if r <= 41.12 else 'both memory-bound')}")
+
+    if not mock and not sm_partition.preflight(min(PILOT_SM_SWEEP_COUNTS), SM_TOTAL, mock):
+        print("   ABORT: refusing to run an SM sweep that cannot actually restrict SMs.")
+        print("          Start MPS then re-run:  nvidia-cuda-mps-control -d")
+        return
+
+    for sm in PILOT_SM_SWEEP_COUNTS:
+        cells = [(c, d) for d in PILOT_SM_SWEEP_DATASETS for c in PILOT_SM_SWEEP_CONDITIONS]
+        if all(path_for(sm, c, d).exists() for c, d in cells):
+            print(f"   skip sm={sm} (all {len(cells)} runs done)")
+            continue
+        env = sm_partition.env_for_sm_limit(sm, SM_TOTAL)
+        cmd = [sys.executable, str(Path(__file__).resolve()),
+               "--mode", "pilot", "--sweep", "sm", "--_sm-child", str(sm)]
+        if mock:
+            cmd.append("--mock")
+        print(f"   -> launching child for sm={sm} "
+              f"({sm_partition.sm_to_percent(sm, SM_TOTAL)}% MPS thread cap)")
+        rc = subprocess.run(cmd, env=env).returncode
+        if rc != 0:
+            print(f"   !! child for sm={sm} exited {rc} — continuing to next level "
+                  f"(re-run to retry; finished cells are skipped)")
+
+    paths = {}
+    for sm in PILOT_SM_SWEEP_COUNTS:
+        for ds in PILOT_SM_SWEEP_DATASETS:
+            for cond in PILOT_SM_SWEEP_CONDITIONS:
+                p = path_for(sm, cond, ds)
+                if p.exists():
+                    paths[(sm, cond, ds)] = p
+    rows = []
+    for (sm, cond, ds), p in paths.items():
+        try:
+            d = json.loads(p.read_text())
+            rows.append((sm, (d.get("energy_kwh") or {}).get("gpu_kwh"),
+                         d.get("wall_time_s"), f"{cond}/{ds}", d.get("total_tokens")))
+        except Exception:
+            continue
+    print("\n   === SM sweep summary (GPU energy; compare conditions WITHIN an SM level) ===")
+    _sweep_summary(rows, "SMs",
+                   "   -> Next: re-capture the roofline AT EACH SM LEVEL and pass --sm-count so\n"
+                   "      analyze_roofline.py scales the peak and moves the ridge:\n"
+                   "         python profiling/analyze_roofline.py --sm-count <N> \\\n"
+                   "             --draft-csv ... --verify-csv ...\n"
+                   "      The MODEL picks the sweep points; the MEASUREMENT decides the verdict.")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -877,11 +1218,69 @@ def main():
     ap.add_argument("--allow-clock-mismatch", action="store_true")
     ap.add_argument("--recalibrate", action="store_true",
                     help="refit entropy calibration even if calibration/fitted_<pair>.json exists")
+    # ---- ridge-crossing experiment selector (both approaches, one codebase) ----
+    ap.add_argument("--sweep", choices=["none", "batch", "sm"], default="none",
+                    help="none = the standard 75-run pilot matrix + f_low sweep (default, "
+                         "unchanged); batch = Approach 1 (raise MAX_NUM_SEQS to lift I_verify "
+                         "past the ridge); sm = Approach 2 (restrict SMs to lower the ridge "
+                         "through the phase intensities)")
+    ap.add_argument("--max-num-seqs", type=int, default=None,
+                    help="override MAX_NUM_SEQS for a one-off run (the batch sweep sets this "
+                         "per level automatically)")
+    ap.add_argument("--max-model-len", type=int, default=None,
+                    help="override MAX_MODEL_LEN for a one-off run")
+    ap.add_argument("--_sm-child", type=int, default=None,
+                    help=argparse.SUPPRESS)   # internal: one SM level, set by run_sm_sweep()
     args = ap.parse_args()
+
+    global MAX_NUM_SEQS, MAX_MODEL_LEN
+    if args.max_num_seqs is not None:
+        MAX_NUM_SEQS = args.max_num_seqs
+    if args.max_model_len is not None:
+        MAX_MODEL_LEN = args.max_model_len
 
     global F_HIGH, F_LOW
     F_HIGH, F_LOW = resolve_clocks(args.mock, args.allow_clock_mismatch)
     reset_clocks(args.mock)   # clean start: clear any lock left by a prior/crashed run
+
+    # ---- SWEEP DISPATCH ---------------------------------------------------------------
+    # Both ridge-crossing experiments short-circuit the standard matrix: they are separate,
+    # self-contained studies writing to their own results/<name>_sweep/ dir, so they neither
+    # read nor write results/pilot/ and cannot disturb the 75 runs already collected.
+    # --sweep none (the default) leaves the original behaviour byte-for-byte unchanged.
+    if args._sm_child is not None:
+        install_dvfs(args.mock)
+        try:
+            run_sm_sweep(mock=args.mock, only_sm=args._sm_child)
+        finally:
+            reset_clocks(args.mock)
+        return
+    if args.sweep in ("batch", "sm"):
+        install_dvfs(args.mock)
+        # Entropy coefficients are reused from the main pilot's fit; the sweeps deliberately
+        # do NOT recalibrate (a per-level refit would confound the axis under test with a
+        # changing controller). Warn if no fit exists rather than silently using the fallback.
+        if not calibration_path(PILOT_MODEL).exists():
+            print(f"    NOTE: no calibration/fitted_{PILOT_MODEL}.json — adaptive_entropy will "
+                  f"use the GELATO baseline (a=1,b=-0.35). Run the main pilot first for a fit.")
+        completed_sweep = False
+        try:
+            if args.sweep == "batch":
+                run_batch_sweep(mock=args.mock)
+            else:
+                run_sm_sweep(mock=args.mock)
+            completed_sweep = True
+        finally:
+            reset_clocks(args.mock)
+            bar = "#" * 74
+            print("\n" + bar)
+            print(f"##  {args.sweep.upper()} SWEEP {'COMPLETE' if completed_sweep else 'INTERRUPTED'}"
+                  f"  —  GPU clocks reset.".ljust(70) + "##")
+            print(f"##  results: {str(RESULTS_DIR / (args.sweep + '_sweep')):<57}##")
+            print("##  Re-run the SAME command to resume (finished runs are skipped).".ljust(72) + "##")
+            print(bar)
+        return
+    # -----------------------------------------------------------------------------------
 
     matrix = PILOT_MATRIX if args.mode == "pilot" else build_full_matrix()
     reps = PILOT_REPS if args.mode == "pilot" else FULL_REPS

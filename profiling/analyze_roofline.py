@@ -30,7 +30,8 @@ Two ways to supply the numbers:
         python profiling/analyze_roofline.py \
             --draft-csv profiling/out/draft.csv --verify-csv profiling/out/verify.csv
 
-Override the GPU peaks with --peak-tflops / --peak-bw-gbs (defaults: RTX 3090).
+GPU peaks are chosen automatically from the ncu CSV's Device column (RTX 3090 vs 4090);
+override with --gpu 3090|4090 or --peak-tflops/--peak-bw-gbs.
 """
 
 from __future__ import annotations
@@ -42,11 +43,16 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))   # so gpu_profiles (repo root) imports on the laptop too
 
-# RTX 3090 defaults (same as profiling/roofline.py — keep them in sync).
-# 71.0 = bf16 tensor-core peak, FP32 accumulate (matches counting tensor-core FLOPs below).
-RTX3090_PEAK_TFLOPS = 71.0
-RTX3090_PEAK_BW_GBS = 936.0
+from gpu_profiles import GPU_PROFILES, DEFAULT_GPU, profile_for_name  # noqa: E402
+
+# Roofline ceilings are GPU-specific (3090 vs 4090). This script runs on the LAPTOP (no GPU),
+# so it cannot detect the card directly — it reads the GPU name from the ncu CSV's 'Device'
+# column (the CSV was produced on the VM, so the name is in it) and looks the peaks up in
+# gpu_profiles.py. --gpu / --peak-* override. These two are only the LAST-RESORT fallback.
+RTX3090_PEAK_TFLOPS = GPU_PROFILES["rtx_3090"]["peak_tflops_bf16"]
+RTX3090_PEAK_BW_GBS = GPU_PROFILES["rtx_3090"]["peak_bw_gbs"]
 
 # ncu metric names. bf16 LLM math is dominated by tensor-core GEMMs, which the FP32 thread-
 # instruction counters (fadd/fmul/ffma) DO NOT count — counting only those makes every phase
@@ -85,35 +91,40 @@ def ridge_point(peak_tflops, peak_bw_gbs):
 # ── best-effort ncu --csv parsing ─────────────────────────────────────────────
 
 def _parse_ncu_csv(path: Path):
-    """Return (flops, bytes, metrics_seen) summed across all kernels in the CSV.
+    """Return (flops, bytes, metrics_seen, device_name) summed across all kernels in the CSV.
 
-    Tolerant of column-name variation: finds the 'Metric Name' / 'Metric Value'
-    columns case-insensitively. Returns flops/bytes as None when a metric family
-    is entirely absent (so the caller can fall back to manual numbers).
+    Tolerant of column-name variation: finds the 'Metric Name' / 'Metric Value' columns
+    case-insensitively, and the 'Device' column if present (ncu records the GPU name there,
+    which is how this laptop-side script learns which card produced the CSV). Returns
+    flops/bytes as None when a metric family is entirely absent (caller falls back).
     """
     rows = list(csv.reader(path.open(encoding="utf-8", errors="ignore")))
     if not rows:
-        return None, None, set()
+        return None, None, set(), None
     # Find the header row (ncu prepends banner lines before the CSV header).
     header_idx = next((i for i, r in enumerate(rows)
                        if any(c.strip().lower() == "metric name" for c in r)), None)
     if header_idx is None:
-        return None, None, set()
+        return None, None, set(), None
     header = [c.strip().lower() for c in rows[header_idx]]
     try:
         name_col = header.index("metric name")
         val_col = header.index("metric value")
     except ValueError:
-        return None, None, set()
+        return None, None, set(), None
+    dev_col = header.index("device") if "device" in header else None
 
     flops = 0.0
     byts = 0.0
     seen = set()
+    device = None
     saw_flop_metric = False
     saw_bytes_metric = False
     for r in rows[header_idx + 1:]:
         if len(r) <= max(name_col, val_col):
             continue
+        if device is None and dev_col is not None and len(r) > dev_col and r[dev_col].strip():
+            device = r[dev_col].strip()
         name = r[name_col].strip()
         if not name:
             continue
@@ -133,14 +144,14 @@ def _parse_ncu_csv(path: Path):
                 saw_flop_metric = True
     return (flops if saw_flop_metric else None,
             byts if saw_bytes_metric else None,
-            seen)
+            seen, device)
 
 
 def _phase_from_csv(label, path_str):
     path = Path(path_str)
     if not path.exists():
         sys.exit(f"FAIL: {label} CSV not found: {path}")
-    flops, byts, seen = _parse_ncu_csv(path)
+    flops, byts, seen, device = _parse_ncu_csv(path)
     if flops is None or byts is None:
         missing = []
         if flops is None:
@@ -151,7 +162,7 @@ def _phase_from_csv(label, path_str):
         print(f"  WARN: could not extract {' and '.join(missing)} from {path.name}.")
         print(f"        metrics present: {sorted(seen) if seen else '(none parsed)'}")
         sys.exit("  -> re-run ncu with those --metrics, or pass the numbers manually (mode A).")
-    return {"name": label, "flops": flops, "bytes": byts}
+    return {"name": label, "flops": flops, "bytes": byts}, device
 
 
 # ── verdict + plot ────────────────────────────────────────────────────────────
@@ -213,6 +224,51 @@ def _plot(rows, I_star, peak_tflops, peak_bw_gbs, out_png):
     fig.tight_layout(); fig.savefig(out_png, dpi=130); plt.close(fig)
 
 
+def _apply_sm_scaling(peak_tflops, peak_bw_gbs, sm_count, sm_total):
+    """APPROACH 2: scale the peak for a process restricted to `sm_count` of `sm_total` SMs.
+
+    Compute scales ~linearly with the SM fraction. BANDWIDTH IS LEFT UNCHANGED: the memory
+    controllers and L2 hang off the crossbar, not off individual SMs, so masking SMs does not
+    remove memory channels. Net effect: the ridge I* = peak_FLOPS/peak_BW moves DOWN, sliding
+    through the (fixed, measured) phase intensities. Phase intensities themselves do not move
+    — same kernels, same FLOPs, same bytes — which is what makes this a clean instrument.
+
+    CAVEAT worth carrying into the writeup: with fewer SMs issuing memory requests, ACHIEVED
+    bandwidth can also fall (fewer outstanding requests to saturate DRAM). If it does, the true
+    ridge is somewhat LOWER than this linear model says. Treat the model as the thing that
+    picks sweep points and the measurement as the thing that decides the verdict.
+    """
+    if sm_count is None or int(sm_count) >= int(sm_total):
+        return peak_tflops, peak_bw_gbs
+    frac = int(sm_count) / float(sm_total)
+    scaled = peak_tflops * frac
+    print(f"  SM restriction: {sm_count}/{sm_total} SMs ({frac*100:.0f}%) -> "
+          f"peak {peak_tflops:.1f} -> {scaled:.1f} TFLOP/s (bandwidth unchanged at "
+          f"{peak_bw_gbs:.0f} GB/s)")
+    return scaled, peak_bw_gbs
+
+
+def _resolve_peaks(gpu_arg, peak_t, peak_bw, device_name):
+    """Pick (peak_tflops, peak_bw_gbs). Explicit --peak-* win; else --gpu 3090/4090; else
+    'auto' reads the GPU name parsed from the ncu CSV's Device column. Falls back to
+    DEFAULT_GPU with a warning if nothing identifies the card."""
+    if gpu_arg in ("3090", "4090"):
+        prof = GPU_PROFILES[f"rtx_{gpu_arg}"]
+        print(f"  GPU peaks: --gpu {gpu_arg} -> {prof['peak_tflops_bf16']} TFLOP/s, {prof['peak_bw_gbs']} GB/s")
+    else:  # auto
+        key, prof = profile_for_name(device_name)
+        if prof is None:
+            prof = GPU_PROFILES[DEFAULT_GPU]
+            print(f"  WARN: GPU not identifiable from the CSV (device={device_name!r}); using "
+                  f"{DEFAULT_GPU} peaks. Pass --gpu 3090|4090 or --peak-tflops/--peak-bw-gbs to be sure.")
+        else:
+            print(f"  GPU from ncu CSV: {device_name} [{key}] -> "
+                  f"{prof['peak_tflops_bf16']} TFLOP/s, {prof['peak_bw_gbs']} GB/s")
+    t = peak_t if peak_t is not None else prof["peak_tflops_bf16"]
+    bw = peak_bw if peak_bw is not None else prof["peak_bw_gbs"]
+    return t, bw
+
+
 def main():
     ap = argparse.ArgumentParser(description="Roofline GO/NO-GO from per-phase FLOPs + bytes")
     ap.add_argument("--draft-flops", type=float)
@@ -221,24 +277,39 @@ def main():
     ap.add_argument("--verify-bytes", type=float)
     ap.add_argument("--draft-csv")
     ap.add_argument("--verify-csv")
-    ap.add_argument("--peak-tflops", type=float, default=RTX3090_PEAK_TFLOPS)
-    ap.add_argument("--peak-bw-gbs", type=float, default=RTX3090_PEAK_BW_GBS)
+    ap.add_argument("--gpu", choices=["auto", "3090", "4090"], default="auto",
+                    help="hardware peaks: auto = read the GPU from the ncu CSV's Device column")
+    ap.add_argument("--peak-tflops", type=float, default=None, help="override bf16 tensor peak")
+    ap.add_argument("--peak-bw-gbs", type=float, default=None, help="override DRAM bandwidth (GB/s)")
+    ap.add_argument("--sm-count", type=int, default=None,
+                    help="APPROACH 2: number of SMs the profiled process was restricted to. "
+                         "Scales peak FLOPS by sm_count/sm_total (bandwidth unchanged), which "
+                         "moves the ridge DOWN through the measured phase intensities. Pass the "
+                         "same N used for the sm_sweep level that produced these CSVs.")
+    ap.add_argument("--sm-total", type=int, default=82,
+                    help="total SMs on the card (82 = RTX 3090 / GA102)")
     ap.add_argument("--out-json", default=str(PROJECT_ROOT / "profiling" / "out" / "roofline.json"))
     ap.add_argument("--out-png", default=str(PROJECT_ROOT / "profiling" / "out" / "roofline.png"))
     args = ap.parse_args()
 
     manual = all(v is not None for v in
                  (args.draft_flops, args.draft_bytes, args.verify_flops, args.verify_bytes))
+    device = None
     if manual:
         phases = [{"name": "draft", "flops": args.draft_flops, "bytes": args.draft_bytes},
                   {"name": "verify", "flops": args.verify_flops, "bytes": args.verify_bytes}]
     elif args.draft_csv and args.verify_csv:
-        phases = [_phase_from_csv("draft", args.draft_csv),
-                  _phase_from_csv("verify", args.verify_csv)]
+        d_phase, d_dev = _phase_from_csv("draft", args.draft_csv)
+        v_phase, v_dev = _phase_from_csv("verify", args.verify_csv)
+        phases = [d_phase, v_phase]
+        device = d_dev or v_dev
     else:
         ap.error("supply either all four --{draft,verify}-{flops,bytes}, "
                  "or both --draft-csv and --verify-csv.")
-    analyze(phases, args.peak_tflops, args.peak_bw_gbs, args.out_json, args.out_png)
+
+    peak_t, peak_bw = _resolve_peaks(args.gpu, args.peak_tflops, args.peak_bw_gbs, device)
+    peak_t, peak_bw = _apply_sm_scaling(peak_t, peak_bw, args.sm_count, args.sm_total)
+    analyze(phases, peak_t, peak_bw, args.out_json, args.out_png)
 
 
 if __name__ == "__main__":
