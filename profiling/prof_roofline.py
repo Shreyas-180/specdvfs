@@ -21,17 +21,31 @@ USAGE (on the VM, after setup + HF login):
     # 0) PRE-FLIGHT (no ncu): confirm the NVTX hooks fire in-process.
     python profiling/prof_roofline.py --gamma 5 --selftest
 
-    # 1) DRAFT then VERIFY, bounded so ncu can't hang (see profiling/roofline.py USAGE
-    #    for the full $M metric list incl. the tensor-core op metric):
-    ncu --profile-from-start off --nvtx --nvtx-include "specdvfs_draft/"  \
+    # 1) DRAFT then VERIFY (see profiling/roofline.py USAGE for the full $M metric list
+    #    incl. the tensor-core op metric). NOTE --replay-mode application is REQUIRED, not
+    #    optional: ncu's default kernel replay rewinds individual kernels in isolation, but
+    #    vLLM speculative decoding reads the rejection sampler's acceptance count back to the
+    #    CPU mid-iteration to choose control flow — so the CPU blocks on a device->host copy
+    #    of a value produced by the very kernel ncu is mid-replay on. That circular wait
+    #    parks the process at 0% GPU (the "ncu hang"). Application replay re-runs the whole
+    #    tiny deterministic (temp=0/seed=42) program once per pass, so nothing is rewound and
+    #    it cannot deadlock. Cost: the model is (re)loaded each pass — seconds, not the
+    #    indefinite hang. The driver warms up once before the profiled region so the capture
+    #    is steady-state decode only (that warmup is excluded by --profile-from-start off).
+    ncu --replay-mode application --profile-from-start off \
+        --nvtx --nvtx-include "specdvfs_draft/" \
         --metrics "$M" --target-processes all --csv \
         python profiling/prof_roofline.py --gamma 5 --n-prompts 1 --max-tokens 8 \
         > profiling/out/draft.csv
-    ncu --profile-from-start off --nvtx --nvtx-include "specdvfs_verify/" \
+    ncu --replay-mode application --profile-from-start off \
+        --nvtx --nvtx-include "specdvfs_verify/" \
         --metrics "$M" --target-processes all --csv \
         python profiling/prof_roofline.py --gamma 5 --n-prompts 1 --max-tokens 8 \
         > profiling/out/verify.csv
-    # add --replay-mode application if a custom kernel errors under kernel-replay.
+    # If perf counters are admin-locked (ERR_NVGPUCTRPERM, common on cloud VMs):
+    #   prefix with  sudo env "PATH=$PATH"  . Optionally add --launch-count N to profile
+    #   only the first N kernels of the phase (the intensity is a ratio, so a representative
+    #   sample suffices) if a pass is slower than you like.
 
     # 2) verdict + plot:
     python profiling/analyze_roofline.py \
@@ -115,17 +129,30 @@ def main():
         print("  -> hooks OK; safe to run this same script under ncu (see USAGE).", file=sys.stderr)
         return
 
-    # Bracket ONLY the generate in the CUDA profiler region. Run ncu with
-    # `--profile-from-start off` so model load is NOT profiled (loading an 8B model
-    # under ncu instrumentation is slow and was a likely cause of the apparent hang);
-    # profiling switches on here and off right after, scoping the capture to decode.
-    # Without ncu these calls are harmless no-ops.
     import torch
+    # WARMUP (not profiled): run the SAME NVTX-ranged generate once with the profiler still
+    # OFF (--profile-from-start off + we have not called profiler.start() yet), so first-
+    # iteration lazy CUDA allocations / autotuning are completed here and the profiled
+    # region below contains only steady-state decode kernels. The warmup enters the draft/
+    # verify NVTX ranges too, but is excluded from the capture because profiling is off.
+    llm.generate(prompts, sp)
+    torch.cuda.synchronize()
+
+    # Profiled region: bracket ONLY the steady-state generate. Two scoping mechanisms combine
+    # so the capture is exactly the decode phase: --nvtx-include restricts WHICH kernels count
+    # (draft xor verify), and --profile-from-start off + this start()/stop() pair restrict WHEN
+    # (model load and the warmup above are outside it). Run ncu with --replay-mode application
+    # (NOT the default kernel replay): vLLM spec decode reads acceptance counts back to the CPU
+    # mid-iteration to pick control flow, and kernel replay rewinds individual kernels while the
+    # CPU is blocked on exactly those results — a circular wait that parks the process at 0% GPU.
+    # Application replay re-runs the whole tiny deterministic program per pass, so it can't
+    # deadlock. Without ncu these profiler calls are harmless no-ops.
     torch.cuda.profiler.start()
     try:
         llm.generate(prompts, sp)
     finally:
         torch.cuda.profiler.stop()
+        torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

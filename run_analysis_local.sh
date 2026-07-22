@@ -21,19 +21,35 @@
 
 set -uo pipefail
 
+# Resolve the interpreter ONCE. Many Linux/WSL setups only ship `python3` (no `python`
+# symlink) — calling `python` directly there is a silent no-op under `set -uo pipefail`
+# (no `-e`), which is exactly what caused commands to fail invisibly while the script kept
+# printing its hardcoded "success" lines below. Resolve explicitly and abort clearly instead.
+PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PYTHON" ]; then
+  echo "ERROR: neither 'python3' nor 'python' found on PATH. Install Python 3 "
+  echo "       (+ pandas, numpy, scipy, matplotlib) and re-run." >&2
+  exit 1
+fi
+
 PULLED="${1:-./results_from_vm}"   # where collect_and_destroy.sh put the raw data
 MODE="${2:-pilot}"                 # 'pilot' or 'full' (matches the run JSON subfolder)
 
-echo "==> analysis source: ${PULLED}   mode: ${MODE}"
+echo "==> analysis source: ${PULLED}   mode: ${MODE}   interpreter: ${PYTHON}"
 
 # ---------- pilot/full: run JSONs -> metrics CSV -> tables -> figures ----------
 RUN_JSON_DIR="${PULLED}/results/${MODE}"
 if [ -d "$RUN_JSON_DIR" ] && ls "$RUN_JSON_DIR"/*.json >/dev/null 2>&1; then
   echo "==> [1/2] ${MODE} metrics + tables + figures  (from ${RUN_JSON_DIR})"
-  python evaluation/compute_metrics.py   --results-dir "$RUN_JSON_DIR"
-  python evaluation/aggregate_results.py --runs-csv "evaluation/out/${MODE}/runs.csv"
-  python evaluation/generate_figures.py  --runs-csv "evaluation/out/${MODE}/runs.csv"
-  echo "    -> evaluation/out/${MODE}/  (runs.csv, savings_*.csv, summary_*.csv, figures/)"
+  if "$PYTHON" evaluation/compute_metrics.py   --results-dir "$RUN_JSON_DIR" \
+  && "$PYTHON" evaluation/aggregate_results.py --runs-csv "evaluation/out/${MODE}/runs.csv" \
+  && "$PYTHON" evaluation/generate_figures.py  --runs-csv "evaluation/out/${MODE}/runs.csv"; then
+    echo "    -> evaluation/out/${MODE}/  (runs.csv, savings_*.csv, summary_*.csv, figures/)"
+  else
+    echo "    !! ${MODE} analysis FAILED partway — see the error above. Nothing past the" >&2
+    echo "       failing stage was written; re-run after fixing it (earlier stages' output" >&2
+    echo "       files, if any, are still on disk in evaluation/out/${MODE}/)." >&2
+  fi
 else
   echo "==> [1/2] no run JSONs under ${RUN_JSON_DIR} — skipping ${MODE} analysis."
 fi
@@ -43,8 +59,11 @@ DRAFT="${PULLED}/profiling/out/draft.csv"
 VERIFY="${PULLED}/profiling/out/verify.csv"
 if [ -f "$DRAFT" ] && [ -f "$VERIFY" ]; then
   echo "==> [2/2] roofline verdict  (from ${DRAFT} + ${VERIFY})"
-  python profiling/analyze_roofline.py --draft-csv "$DRAFT" --verify-csv "$VERIFY"
-  echo "    -> profiling/out/roofline.json + roofline.png"
+  if "$PYTHON" profiling/analyze_roofline.py --draft-csv "$DRAFT" --verify-csv "$VERIFY"; then
+    echo "    -> profiling/out/roofline.json + roofline.png"
+  else
+    echo "    !! roofline analysis FAILED — see the error above." >&2
+  fi
 else
   echo "==> [2/2] no roofline CSVs under ${PULLED}/profiling/out — skipping roofline analysis."
   echo "          (phase timing JSONs, if any, are already in ${PULLED}/profiling/out/ — raw, no analysis step.)"

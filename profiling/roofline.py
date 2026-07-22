@@ -35,28 +35,42 @@ import functools
 import importlib
 import json
 import logging
+import sys
 from pathlib import Path
 
 import torch  # GPU-only tool
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from vllm_hooks.patch_spec_decode import (
     WORKER_MODULE, WORKER_CLASS_NAME, PROPOSER_ATTR, SCORER_ATTR,
     DRAFT_METHOD, VERIFY_METHOD,
 )
+from gpu_profiles import GPU_PROFILES, DEFAULT_GPU, detect_profile_via_nvml
 
 log = logging.getLogger(__name__)
 _ROOFLINE_FLAG = "_specdvfs_roofline"
 
-# RTX 3090 peak specs (override with your measured/clock-specific values).
-# IMPORTANT — peak MUST be consistent with how FLOPs are counted (see analyze_roofline.py):
-# the models run in bf16 and almost all FLOPs are tensor-core GEMMs, so FLOP counting now
-# INCLUDES the tensor-core op metric, and the matching ceiling is the bf16 TENSOR-core peak
-# with FP32 accumulate on a GeForce 3090, ~71 TFLOP/s (the 142 TFLOP/s figure is FP16-accumulate;
-# halve for FP32-accumulate). If you instead count ONLY CUDA-core FP (fadd/fmul/ffma), use the
-# non-tensor peak 35.6 TFLOP/s — but then verify lands far left of the ridge and the result is
-# meaningless for a tensor-core workload. Confirm the achieved peak against ncu SpeedOfLight.
-RTX3090_PEAK_TFLOPS = 71.0     # bf16 tensor core, FP32 accumulate (was 35.6 = CUDA-core FP only)
-RTX3090_PEAK_BW_GBS = 936.0    # GDDR6X measured ceiling
+# Roofline ceilings come from the DETECTED GPU (RTX 3090 vs 4090) so this runs on whichever
+# card the instance has. peak MUST be consistent with how FLOPs are counted (analyze_roofline.py
+# now includes the tensor-core op metric), so this is the bf16 TENSOR-core peak with FP32
+# accumulate (the GeForce half-rate number; the FP16-accumulate marketing figure is ~2x). See
+# gpu_profiles.py. The named 3090 constants below remain the fallback when no GPU is visible.
+RTX3090_PEAK_TFLOPS = GPU_PROFILES["rtx_3090"]["peak_tflops_bf16"]   # 71.0 (fallback default)
+RTX3090_PEAK_BW_GBS = GPU_PROFILES["rtx_3090"]["peak_bw_gbs"]        # 936.0
+
+
+def default_peaks():
+    """(peak_tflops_bf16, peak_bw_gbs) for the GPU NVML reports; DEFAULT_GPU profile if the card
+    is unrecognized or absent. Used so ridge_point()/analyze() pick the right ceiling on the VM."""
+    key, prof, name = detect_profile_via_nvml()
+    if prof is None:
+        prof = GPU_PROFILES[DEFAULT_GPU]
+        if name:
+            print(f"  roofline: GPU '{name}' unrecognized — using {DEFAULT_GPU} peaks "
+                  f"(set them explicitly if wrong).")
+    return prof["peak_tflops_bf16"], prof["peak_bw_gbs"]
 
 DRAFT_RANGE = "specdvfs_draft"
 VERIFY_RANGE = "specdvfs_verify"
@@ -137,18 +151,28 @@ def quick_total_flops(llm, prompts, max_tokens=64):
 
 # ── analysis: intensity, roofline plot, GO/NO-GO ──────────────────────────────────────
 
-def ridge_point(peak_tflops=RTX3090_PEAK_TFLOPS, peak_bw_gbs=RTX3090_PEAK_BW_GBS):
-    """Ridge intensity I* = peak_FLOPS / peak_bandwidth, in FLOPs/byte."""
+def ridge_point(peak_tflops=None, peak_bw_gbs=None):
+    """Ridge intensity I* = peak_FLOPS / peak_bandwidth, in FLOPs/byte. When peaks are not
+    given, use the detected GPU's profile (3090 vs 4090)."""
+    if peak_tflops is None or peak_bw_gbs is None:
+        dt, dbw = default_peaks()
+        peak_tflops = dt if peak_tflops is None else peak_tflops
+        peak_bw_gbs = dbw if peak_bw_gbs is None else peak_bw_gbs
     return (peak_tflops * 1e12) / (peak_bw_gbs * 1e9)
 
 
-def analyze(phases, peak_tflops=RTX3090_PEAK_TFLOPS, peak_bw_gbs=RTX3090_PEAK_BW_GBS,
+def analyze(phases, peak_tflops=None, peak_bw_gbs=None,
             out_png="profiling/out/roofline.png", out_json="profiling/out/roofline.json"):
     """phases: list of {'name', 'flops', 'bytes', 'seconds'(optional)} (from ncu --nvtx).
 
     Computes arithmetic intensity per phase, classifies vs the ridge, writes a JSON + a
-    Roofline PNG, and prints the GO/NO-GO verdict for the project premise.
+    Roofline PNG, and prints the GO/NO-GO verdict for the project premise. Peaks default to
+    the detected GPU's profile (3090 vs 4090) when not passed.
     """
+    if peak_tflops is None or peak_bw_gbs is None:
+        dt, dbw = default_peaks()
+        peak_tflops = dt if peak_tflops is None else peak_tflops
+        peak_bw_gbs = dbw if peak_bw_gbs is None else peak_bw_gbs
     I_star = ridge_point(peak_tflops, peak_bw_gbs)
     rows = []
     for p in phases:
@@ -223,31 +247,34 @@ def _plot(rows, I_star, peak_tflops, peak_bw_gbs, out_png):
 #    Expect "draft range fired Nx, verify range fired Mx" with N,M > 0. If either is 0,
 #    the hooks did not attach — fix that FIRST; ncu would capture nothing either.
 #
-# 1) ncu capture, ONE NVTX range per run, bounded so it can't hang:
+# 1) ncu capture, ONE NVTX range per run. Application replay is REQUIRED (see why below):
 #    mkdir -p profiling/out
 #    M="dram__bytes.sum,\
 #smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,\
 #smsp__sass_thread_inst_executed_op_fmul_pred_on.sum,\
 #smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
 #sm__ops_path_tensor_src_bf16_dst_fp32.sum"
-#    ncu --profile-from-start off --nvtx --nvtx-include "specdvfs_draft/" \
+#    ncu --replay-mode application --profile-from-start off \
+#        --nvtx --nvtx-include "specdvfs_draft/" \
 #        --metrics "$M" --target-processes all --csv \
 #        python profiling/prof_roofline.py --gamma 5 --n-prompts 1 --max-tokens 8 \
 #        > profiling/out/draft.csv
-#    ncu --profile-from-start off --nvtx --nvtx-include "specdvfs_verify/" \
+#    ncu --replay-mode application --profile-from-start off \
+#        --nvtx --nvtx-include "specdvfs_verify/" \
 #        --metrics "$M" --target-processes all --csv \
 #        python profiling/prof_roofline.py --gamma 5 --n-prompts 1 --max-tokens 8 \
 #        > profiling/out/verify.csv
-#    Why this does not hang/crash like before:
-#      * --profile-from-start off + the driver's profiler.start/stop => the 8B model LOAD
-#        is not profiled (loading under ncu instrumentation is the slow/"stuck" part);
-#      * --metrics (not full --section) => only a few replay passes per kernel;
-#      * tiny workload (1 prompt, 8 tokens) => a bounded kernel count, not a full generate;
-#      * eager build => no CUDA-graph kernels for ncu to choke on.
-#    If a specific custom kernel still ERRORS under kernel-replay (the earlier
-#    fused_add_rms_norm crash), add `--replay-mode application` (re-runs the tiny app per
-#    pass instead of per-kernel save/restore — slower but robust). VERIFY the metric names
-#    against your ncu version (esp. the tensor op name) before a long run; list with
+#    Why --replay-mode application (not the default kernel replay): vLLM spec decode reads the
+#    rejection sampler's acceptance count back to the CPU mid-iteration to choose control flow.
+#    Kernel replay rewinds individual kernels in isolation while the CPU is blocked on exactly
+#    those results -> circular wait -> process parks at 0% GPU (the hang seen with the default
+#    mode). Application replay re-runs the whole tiny deterministic (temp=0/seed=42) program
+#    per pass, so nothing is rewound; the model reloads each pass (seconds), no deadlock.
+#    Also: --metrics (not full --section) keeps passes few; tiny workload (1 prompt, 8 tokens)
+#    bounds the kernel count; the eager build means no CUDA-graph kernels; and the driver warms
+#    up once before the profiled region (excluded by --profile-from-start off) so the capture is
+#    steady-state decode. If counters are admin-locked (ERR_NVGPUCTRPERM), prefix the command
+#    with `sudo env "PATH=$PATH"`. VERIFY metric names against your ncu version first:
 #    `ncu --query-metrics | grep -E "ops_path_tensor|dram__bytes"`.
 #
 # 2) Verdict + plot:

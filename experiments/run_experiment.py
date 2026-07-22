@@ -87,6 +87,15 @@ MODEL_PAIRS = {
     "llama_8b_1b":   {"target": "meta-llama/Llama-3.1-8B-Instruct",
                       "draft": "meta-llama/Llama-3.2-1B-Instruct",
                       "family": "llama3", "eagle_head": None},
+    # Same 8B-Instruct target, but the BASE (non-instruct) 1B as the draft. Valid SD
+    # config: 3.1/3.2 share the 128k tokenizer, so draft/target tokens align; only the
+    # draft's predictions differ. A base draft is less aligned with the instruct target,
+    # so expect LOWER alpha than llama_8b_1b — useful contrast (more of the alpha range
+    # exercised, and a second entropy->alpha calibration). family stays llama3 because the
+    # prompts are formatted for the (instruct) TARGET; the draft just consumes those tokens.
+    "llama_8b_1b_base": {"target": "meta-llama/Llama-3.1-8B-Instruct",
+                         "draft": "meta-llama/Llama-3.2-1B",
+                         "family": "llama3", "eagle_head": None},
     "vicuna13b_68m": {"target": "lmsys/vicuna-13b-v1.3", "draft": "double7/vicuna-68m",
                       "family": "vicuna", "eagle_head": None},   # optional legacy
 }
@@ -132,9 +141,10 @@ FULL_CONDITIONS = SUPPORTED_CONDITIONS + PENDING_CONDITIONS
 DVFS_MODE_CONDITIONS = [c for c in (SUPPORTED_CONDITIONS + PENDING_CONDITIONS) if c != "off"]
 
 # ---- PILOT (alpha variance + all four phase-DVFS policies, incl. the entropy one) ----
-# NOTE: pilot uses the Llama pair, not Qwen3 — vLLM 0.6.6 (pinned for the patch's
+# NOTE: pilot uses the Llama pairs, not Qwen3 — vLLM 0.6.6 (pinned for the patch's
 # spec_decode hooks) predates the Qwen3 architecture, so Qwen3 will not load on it.
-# Llama-3.1-8B / 3.2-1B are supported by 0.6.6 (they are GATED — needs HF auth).
+# Two draft choices on the SAME Llama-3.1-8B-Instruct target: the 3.2-1B-Instruct draft
+# (llama_8b_1b) and the 3.2-1B BASE draft (llama_8b_1b_base). All GATED — needs HF auth.
 #
 # WHY THE OLD PILOT FAILED TO BE USEFUL.  It fixed (model, strategy, dataset) and swept
 # DVFS conditions only.  But alpha (= num_accepted / num_draft; see metrics_reader) is
@@ -164,15 +174,20 @@ DVFS_MODE_CONDITIONS = [c for c in (SUPPORTED_CONDITIONS + PENDING_CONDITIONS) i
 #   adaptive_entropy — LEADING signal: verify clock from alpha_hat = a*exp(b*H) on the
 #                    draft's output entropy H, set within the same iteration. Needs the
 #                    per-pair (a,b) fit; calibrate_pairs_if_needed() auto-runs a 'collect'
-#                    pre-pass (DVFS-off) and writes calibration/fitted_llama_8b_1b.json
-#                    before the matrix (GELATO baseline a=1,b=-0.35 if the fit yields none).
+#                    pre-pass (DVFS-off) PER PAIR and writes calibration/fitted_<pair>.json
+#                    before the matrix (GELATO baseline a=1,b=-0.35 if a fit yields none).
 #                    RISK: this is the least-tested path — it depends on the draft lm_head
 #                    entropy hook firing. If last_entropy stays None, core.py degrades it to
 #                    the lagging-alpha path (so it would look like adaptive_alpha). Sanity-
 #                    check the fit JSON exists and that entropy runs differ from alpha runs.
 # Deferred to the full run: fixed_low and coarse (pure granularity/− ablations; they bear
 # on neither "does alpha vary" nor "does the leading signal help").
-PILOT_MODEL = "llama_8b_1b"
+#
+# TWO PAIRS (per request): the same matrix is run for BOTH draft choices, so the base vs
+# instruct draft can be compared on identical conditions (and each gets its own entropy
+# calibration). The base draft should sit at lower alpha, widening the range tested.
+PILOT_PAIRS = ["llama_8b_1b", "llama_8b_1b_base"]      # 1B-instruct draft, then 1B-base draft
+PILOT_MODEL = PILOT_PAIRS[0]                           # carries the shared vanilla + the f_low sweep
 PILOT_GAMMAS = [5, 12, 18]                             # draft sizes -> the alpha axis
 PILOT_STRATEGIES = [f"spec_g{g}" for g in PILOT_GAMMAS]
 PILOT_DATASETS = ["gsm8k", "humaneval", "cnndm"]       # math / code / summarization
@@ -181,12 +196,22 @@ PILOT_N_PROMPTS = 64
 PILOT_REPS = 1                                         # unchanged (per request)
 FULL_REPS = 5
 
-# 4 conditions x 3 gammas x 3 datasets + ONE vanilla (no-SD) reference per dataset
-# (vanilla is gamma-independent, so it is not swept over gamma).
-# = 3 vanilla + (4 * 3 * 3) = 3 + 36 = 39 runs at REPS=1 (the f_low sweep below adds more).
+# 2 pairs x 4 conditions x 3 gammas x 3 datasets, plus ONE vanilla (no-SD) reference per
+# dataset. Vanilla loads the TARGET only (no draft) and both pairs share the same 8B
+# target, so the vanilla baseline is physically identical for both — run it ONCE under
+# PILOT_PAIRS[0] (3 runs), NOT per pair. = 3 + (2 * 4 * 3 * 3) = 3 + 72 = 75 runs at REPS=1
+# (matches the requested 36 + 36 + 3); the f_low sweep below adds 5 -> 80 total.
+# RESUME NOTE: filenames for the llama_8b_1b portion are UNCHANGED from the single-pair
+# matrix this replaces, so an existing results/pilot/ with those 39 files already done is
+# matched as-is by the skip logic below (both the per-file check and the per-group
+# groupby skip) — only the new llama_8b_1b_base rows (36 files) will actually run.
+# NOTE for analysis: savings_vs_off is per-cell and works for both pairs. savings_vs_vanilla
+# for llama_8b_1b_base must reuse llama_8b_1b's vanilla rows (same target) — the base pair
+# has no vanilla rows of its own by design.
 PILOT_MATRIX = (
     [(PILOT_MODEL, "vanilla", "off", ds) for ds in PILOT_DATASETS]
-    + [(PILOT_MODEL, strat, cond, ds)
+    + [(pair, strat, cond, ds)
+       for pair in PILOT_PAIRS
        for strat in PILOT_STRATEGIES
        for ds in PILOT_DATASETS
        for cond in PILOT_CONDITIONS]
@@ -213,6 +238,8 @@ PILOT_MATRIX = (
 #   * 735 is included as the reference point, so the sweep is self-contained.
 # This is a DIAGNOSTIC that informs the f_low for the full run; it does not feed back into
 # the matrix above (those run at the current F_LOW so the four policies stay comparable).
+# One sweep covers BOTH pairs: the 1B-base and 1B-instruct drafts have identical architecture
+# (same kernels), so the draft-clock power/time curve — hence the optimal f_low — is the same.
 PILOT_FLOW_SWEEP_STRATEGY = "spec_g18"
 PILOT_FLOW_SWEEP_DATASET = "gsm8k"
 PILOT_FLOW_SWEEP_MHZ = [480, 600, 735, 870, 990]       # snapped to supported levels at runtime
@@ -814,11 +841,15 @@ def run_flow_sweep(n_prompts, mock=False):
             reset_clocks(mock)
 
     # Summary: read back the sweep JSONs and rank by energy (the optimum is the min).
+    # energy_kwh is a dict ({"total_kwh","gpu_kwh","cpu_kwh","ram_kwh"} — see EnergyMeter.stop()),
+    # not a scalar; total_kwh is the field to rank by here (same "total is a valid proxy for
+    # draft energy since verify is held at f_high" reasoning as the rest of this function).
     rows = []
     for f in flows:
         try:
             d = json.loads(paths[f].read_text())
-            rows.append((f, d.get("energy_kwh"), d.get("wall_time_s")))
+            energy_total = (d.get("energy_kwh") or {}).get("total_kwh")
+            rows.append((f, energy_total, d.get("wall_time_s")))
         except Exception:
             continue
     have = [r for r in rows if r[1] is not None]

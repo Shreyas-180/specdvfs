@@ -31,6 +31,15 @@ GROUP = ["model_pair", "strategy", "dvfs_condition", "dataset"]
 METRICS = ["gpu_energy_Wh", "total_energy_Wh", "wall_time_s", "tokens_per_s",
            "gpu_wh_per_1k", "total_wh_per_1k", "edp_gpu", "edp_total", "alpha_mean"]
 
+# Pairs that share a TARGET model with another pair intentionally have no vanilla rows of
+# their own — run_experiment.py's pilot runs vanilla (target-only, no draft) ONCE per shared
+# target, tagged under the first pair using it, since vanilla can't depend on which draft is
+# paired with that target. Map such a pair to the pair whose vanilla rows are the physically
+# identical baseline for it, so savings_vs_vanilla doesn't just silently skip it.
+VANILLA_FALLBACK = {
+    "llama_8b_1b_base": "llama_8b_1b",   # both target meta-llama/Llama-3.1-8B-Instruct
+}
+
 
 def parse_gamma(strategy: str):
     """'spec_g5' -> 5; vanilla/spec_dyn/eagle3 -> None."""
@@ -102,9 +111,16 @@ def savings_vs_vanilla(df: pd.DataFrame) -> pd.DataFrame:
     conditions = sorted(df.dvfs_condition.unique())
     for model in sorted(df.model_pair.unique()):
         for ds in sorted(df.dataset.unique()):
-            # vanilla only runs under 'off'
-            van_gpu = _vals(df, model, "vanilla", "off", ds, "gpu_energy_Wh")
-            van_time = _vals(df, model, "vanilla", "off", ds, "wall_time_s")
+            # vanilla only runs under 'off'. A pair may have no vanilla rows of its own
+            # (VANILLA_FALLBACK) — fall back to the pair whose vanilla is the same physical
+            # baseline (same target), and record which one was actually used so this
+            # substitution is visible in the output, not silent.
+            van_model = model
+            van_gpu = _vals(df, van_model, "vanilla", "off", ds, "gpu_energy_Wh")
+            if van_gpu.empty and model in VANILLA_FALLBACK:
+                van_model = VANILLA_FALLBACK[model]
+                van_gpu = _vals(df, van_model, "vanilla", "off", ds, "gpu_energy_Wh")
+            van_time = _vals(df, van_model, "vanilla", "off", ds, "wall_time_s")
             if van_gpu.empty:
                 continue
             for strat in sd_strats:
@@ -116,6 +132,7 @@ def savings_vs_vanilla(df: pd.DataFrame) -> pd.DataFrame:
                     rows.append({
                         "model_pair": model, "strategy": strat, "gamma": parse_gamma(strat),
                         "dataset": ds, "dvfs_condition": cond,
+                        "vanilla_source": van_model,
                         "gpu_energy_ratio_vs_vanilla": (van_gpu.mean() / c_gpu.mean()
                                                         if c_gpu.mean() else np.nan),
                         "speedup_vs_vanilla": (van_time.mean() / c_time.mean()
