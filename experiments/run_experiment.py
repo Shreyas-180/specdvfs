@@ -742,12 +742,12 @@ def build_llm(model_pair, strategy, mock=False, max_num_seqs=None, max_model_len
     if cfg["kind"] == "constant":
         spec = dict(speculative_model=draft, num_speculative_tokens=cfg["gamma"])
     elif cfg["kind"] == "dynamic":
-        spec = dict(speculative_model=draft, num_speculative_tokens=cfg["gamma_max"])  # + dynamic knob: TODO
+        spec = dict(speculative_model=draft, num_speculative_tokens=cfg["gamma_max"])
     elif cfg["kind"] == "eagle":
         head = MODEL_PAIRS[model_pair].get("eagle_head")
         if not head:
             raise NotImplementedError(f"set MODEL_PAIRS['{model_pair}']['eagle_head'] for eagle3.")
-        spec = dict(speculative_model=head, num_speculative_tokens=5)  # + EAGLE method: TODO
+        spec = dict(speculative_model=head, num_speculative_tokens=5)
     else:
         raise NotImplementedError(cfg["kind"])
     return LLM(**common, **spec)
