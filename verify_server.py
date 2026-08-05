@@ -15,19 +15,17 @@ Exit code 1 = at least one critical check failed (do not commit to this machine)
 import shutil          # check 12: locate nvidia-cuda-mps-control
 import sys
 import time
-import subprocess
 
 # --- The project's ACTUALLY CONFIGURED clocks (must track run_experiment.py's F_HIGH/F_LOW).
 # Deliberately NOT the card's reported max: different physical units of the "same" GPU model
 # are binned differently, and the very top of the boost range is frequently NOT sustain-
-# lockable — the firmware throttles it down even under an explicit clock-lock request. That is
-# exactly what "requested 2115, read 1725" is: a real, common phenomenon, not evidence this
-# card is broken. It is why F_HIGH=1935 was chosen as a separately-validated, sustainable
-# value in the first place, rather than trusting nvmlDeviceGetSupportedGraphicsClocks()[-1].
-# Testing lock effectiveness against the reported max (as an earlier version of this file did)
-# gates GO/NO-GO on a number the project never actually requests, producing a false NO-GO on
-# any card whose absolute ceiling happens to be unstable, while saying NOTHING about whether
-# the value actually used is safe on THIS physical unit.
+# lockable — the firmware throttles it down even under an explicit clock-lock request (e.g.
+# "requested 2115, read 1725"), which is a normal phenomenon rather than a broken card. This
+# is why F_HIGH=1935 was chosen as a separately-validated, sustainable value rather than
+# trusting nvmlDeviceGetSupportedGraphicsClocks()[-1]. Gating GO/NO-GO on the reported max
+# would test a frequency the project never requests, producing a false NO-GO on any card
+# whose absolute ceiling happens to be unstable while saying nothing about whether the value
+# actually used is safe on this physical unit.
 PROJECT_F_HIGH = 1935   # keep in sync with run_experiment.py's F_HIGH
 PROJECT_F_LOW = 735     # keep in sync with run_experiment.py's F_LOW
 
@@ -308,7 +306,7 @@ def check_power_telemetry(pynvml, h, torch):
 
     # Confirm CodeCarbon itself can see the GPU.
     try:
-        from codecarbon import EmissionsTracker
+        from codecarbon import EmissionsTracker  # noqa: F401  (availability check only)
         warn("codecarbon importable", True)
     except ImportError:
         warn("codecarbon importable", False, "pip install codecarbon")
@@ -556,3 +554,4 @@ if __name__ == "__main__":
 # The decisive checks are #5 (clock lock read-back), #6 (lock survives load),
 # and #7 (power telemetry is real). A machine can pass a naive "does NVML
 # error" test while failing all three of these silently.
+
