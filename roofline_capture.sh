@@ -3,45 +3,41 @@
 #
 #   bash roofline_capture.sh
 #
-# WHY THERE ARE ONLY 3 CONFIGS (6 captures), NOT 5 SM LEVELS:
+# CAPTURE PLAN: one sm82 baseline + four batch levels {4,8,11,22}, draft and verify
+# each = 10 captures. The reason there is only ONE SM capture rather than one per SM
+# level:
 #
-#   Arithmetic intensity I = FLOPs/bytes is a property of the COMPUTATION, not of
-#   how many SMs are available to run it. Restricting SMs changes how FAST kernels
-#   execute, not how many FLOPs they perform or how many bytes they move. So I is
-#   IDENTICAL at 82, 56, 48 and 40 SMs.
+#   Arithmetic intensity I = FLOPs/bytes is a property of the computation, not of how
+#   many SMs run it. Restricting SMs changes how fast kernels execute, not how many
+#   FLOPs they perform or how many bytes they move, so I is identical across SM counts.
+#   What changes with SM count is the machine's ridge point, I*(N) = (peak_TFLOPS x
+#   N/82) / peak_BW, and analyze_roofline.py --sm-count N computes that from a single
+#   measured intensity pair -- so all SM-level verdicts derive from the one sm82 capture.
 #
-#   What DOES change with SM count is the machine's ridge point:
-#       I*(N) = (peak_TFLOPS x N/82) / peak_BW
-#   and analyze_roofline.py --sm-count N already computes exactly that from a
-#   single measured intensity pair. Verified end-to-end: one unrestricted capture
-#   fed to --sm-count {82,56,48,40} reproduces all four verdicts correctly.
+#   This also sidesteps a hard tooling constraint: ncu cannot profile MPS clients with
+#   the flags this project needs. --mps client forbids --replay-mode application (which
+#   is required to avoid vLLM's CPU-readback deadlock under the default kernel-replay),
+#   and also forbids --csv and --export. Since SM-restricted captures are unnecessary,
+#   no MPS is used here at all.
 #
-#   This matters because ncu CANNOT profile MPS clients with the flags this
-#   project requires: --mps client forbids --replay-mode application (needed to
-#   avoid vLLM's CPU-readback deadlock under the default kernel-replay), and also
-#   forbids --csv and --export. Since SM-restricted captures are unnecessary,
-#   that entire incompatibility is simply sidestepped -- no MPS is used here.
+#   Batch size, unlike SM count, genuinely changes intensity (more concurrent sequences
+#   amortise the same weight-matrix reads over more FLOPs), so each batch level needs
+#   its own capture.
 #
-#   Batch size is different: it genuinely DOES change intensity (more sequences
-#   amortise the same weight-matrix reads over more FLOPs), so bs8 and bs11 need
-#   their own captures. Neither needs MPS either.
-#
-# FLAGS: --replay-mode application (required -- avoids the vLLM spec-decode
-# deadlock that the default kernel-replay hits) and --csv. NOT --launch-count:
-# it was never confirmed to produce a working capture and coincided with two
-# distinct failure modes; every capture that succeeded did so without it.
+# FLAGS: --replay-mode application avoids the vLLM spec-decode deadlock that the default
+# kernel-replay hits. --launch-count is intentionally NOT used (it interacts poorly with
+# application replay here).
 
-# Disable torch.compile()/Dynamo/Inductor -- see roofline_preflight.sh for the
-# full explanation. Without this, a fresh VM's cold compile cache can add
-# 10-15+ minutes of CPU-only compilation (zero GPU activity, looks like a
-# hang) before the FIRST capture even starts. Confirmed fix on 2026-07-27.
+# Disable torch.compile()/Dynamo/Inductor -- see roofline_preflight.sh for the rationale.
+# Without this, a cold compile cache on a fresh VM can add 10-15 min of CPU-only
+# compilation (zero GPU activity, resembling a hang) before the first capture starts.
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
 
 cd ~/specdvfs || { echo "FAIL: ~/specdvfs not found"; exit 1; }
 mkdir -p profiling/out
 
-# Hard stop if MPS is up -- this single condition broke every capture last session.
+# Hard stop if MPS is up -- ncu cannot profile MPS clients with the flags used below.
 if pgrep -f nvidia-cuda-mps-control >/dev/null; then
   echo "FAIL: MPS daemon is running. ncu cannot profile MPS clients with our flags."
   echo "      Stop it first:  echo quit | nvidia-cuda-mps-control"
@@ -53,8 +49,8 @@ M="dram__bytes.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sas
 
 DONE=0; BAD=0
 
-# Validate a CSV the moment it is written, rather than discovering at the end that
-# 12 files are all header-only (which is exactly what happened last session).
+# Validate each CSV as it is written, so a header-only/empty capture is caught
+# immediately rather than at the end of the whole run.
 validate () {
   local f="$1"
   if [ ! -s "$f" ]; then echo "   !! EMPTY: $f"; return 1; fi
@@ -70,17 +66,12 @@ capture () {
   local OUT="$1"; shift
   echo ""
   echo "-- $(date +%H:%M:%S)  capturing $(basename "$OUT")  (timeout 3000s / 50min) --"
-  # 3000s, not 1500 -- this is the FIRST time n_prompts=8 (and n_prompts=BS for the
-  # batch levels) has ever been captured under ncu in this project. Every previously
-  # validated duration (the ~13-14 min draft-phase ceiling that 1500s was based on)
-  # came from batch=1 captures. 8 concurrent sequences genuinely add scheduling/
-  # batch-management overhead per kernel-launch cycle, which compounds across the
-  # multiple full-application relaunches --replay-mode application needs per metric
-  # group. A real batch=8/11/22 capture is expected to run substantially longer than
-  # the batch=1 baseline this timeout was originally calibrated against -- confirmed
-  # 2026-07-28: a batch=8 draft capture exceeded 30 real minutes while nvidia-smi
-  # showed sustained ~108W (well above the ~21-37W true-idle floor), consistent with
-  # genuine work, not a hang.
+  # 3000s timeout: batch captures (n_prompts = batch size) run substantially longer than a
+  # batch=1 capture. Concurrent sequences add scheduling/batch-management overhead per
+  # kernel-launch cycle, which compounds across the multiple full-application relaunches that
+  # --replay-mode application performs per metric group; a draft-phase batch capture can take
+  # well over 30 minutes. Sustained elevated GPU power (well above the ~20-40 W idle floor)
+  # during a long capture indicates genuine work rather than a hang.
   if timeout 3000 env -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE -u SPECDVFS_SM_COUNT \
        "$@" > "$OUT" 2>"${OUT}.log"; then
     if validate "$OUT"; then DONE=$((DONE+1)); return; fi
@@ -101,22 +92,20 @@ capture () {
 }
 
 # =============================================================================
-# CONCURRENCY MUST MATCH THE ENERGY RUNS  (fixed 2026-07-28)
+# CONCURRENCY MUST MATCH THE ENERGY RUNS
 # =============================================================================
-# The previous version of this script passed --n-prompts 1 to EVERY capture. That
-# made max_num_seqs a no-op (it is a concurrency ADMISSION CAP -- it only binds
-# when that many sequences are actually in flight), so:
-#   * bs8 and bs11 measured the identical computation (verify I = 61.24 vs 61.25);
-#   * sm82 measured a batch of ONE, while the SM-sweep energy runs used batch 8.
-# Arithmetic intensity scales ~linearly with concurrency in the weight-dominated
-# regime, so a batch-1 capture materially understates the real intensity and the
-# resulting roofline verdicts describe a configuration that was never benchmarked.
-# prof_roofline.py now auto-raises --n-prompts to --max-num-seqs, but we pass it
-# explicitly here so the intent is visible in the command line and in the logs.
+# Each roofline capture must run at the same concurrency as the energy run it is meant
+# to explain. max_num_seqs is a concurrency admission cap: it only binds when that many
+# sequences are actually in flight, so a capture with n_prompts=1 runs a batch of one
+# regardless of max_num_seqs. Because arithmetic intensity scales ~linearly with
+# concurrency in the weight-dominated regime, a batch-1 capture understates the real
+# intensity and would describe a configuration that was never benchmarked.
+# prof_roofline.py auto-raises --n-prompts to --max-num-seqs; it is also passed
+# explicitly here so the intent is visible in the command line and logs.
 #
 # Each capture below mirrors the engine settings of the energy runs it explains:
-#   SM sweep   -> max_num_seqs 8,  max_model_len 2048
-#   batch sweep-> max_num_seqs BS, max_model_len 1024
+#   SM sweep    -> max_num_seqs 8,  max_model_len 2048
+#   batch sweep -> max_num_seqs BS, max_model_len 1024
 # =============================================================================
 
 # ---- config A: sm82 baseline, at the SM sweep's REAL concurrency (8). ----
