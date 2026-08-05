@@ -4,4 +4,6 @@ calibration/*.json
 calibration/*.png
 data/sampled_indices/
 profiling/out/
+results_from_vm/
+evaluation/out/
 collect_and_destroy.local.sh

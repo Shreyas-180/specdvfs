@@ -75,6 +75,29 @@ _GAMMA_STRATS = sorted(int(s[len("spec_g"):]) for s in STRATEGIES
                        if s.startswith("spec_g") and s[len("spec_g"):].isdigit())
 
 
+def resolve_n_prompts(n_prompts, max_num_seqs):
+    """Return the prompt count that actually makes `max_num_seqs` bind.
+
+    vLLM schedules up to `max_num_seqs` sequences CONCURRENTLY, but it can only do so if at
+    least that many prompts have been submitted. Supplying fewer silently caps real
+    concurrency at the prompt count, so a capture nominally at "batch 11" is really a capture
+    at "batch n_prompts". Arithmetic intensity depends on the REAL concurrency (more
+    sequences amortise the same weight-matrix reads over more FLOPs), so an under-supplied
+    capture measures the wrong configuration while looking perfectly healthy.
+
+    Raising to exactly max_num_seqs fills the batch on the first scheduling step. Note the
+    batch still DECAYS as individual sequences finish and are not replaced; with the tiny
+    --max-tokens used for profiling that is only a couple of decode steps, so the effect is
+    small, but pass a larger --n-prompts explicitly if you want the batch held full longer.
+    """
+    if max_num_seqs is None or n_prompts >= max_num_seqs:
+        return n_prompts
+    print(f"  NOTE: raising --n-prompts {n_prompts} -> {max_num_seqs} to match --max-num-seqs. "
+          f"With only {n_prompts} prompt(s) the scheduler cap would never bind and this "
+          f"capture would measure a batch of {n_prompts}, not {max_num_seqs}.", file=sys.stderr)
+    return max_num_seqs
+
+
 def _active_sm():
     """SM count this capture is actually running under (None = unrestricted).
 
@@ -99,7 +122,21 @@ def main():
     # iterations summed is all that is needed. Bigger values are the main reason a
     # prior ncu run looked like it "hung" (it was replaying every kernel across a
     # full-length generate).
-    ap.add_argument("--n-prompts", type=int, default=1, help="keep tiny — ncu replays kernels")
+    #
+    # *** BUT: n_prompts MUST be >= max_num_seqs, or an Approach-1 batch capture is a NO-OP. ***
+    # max_num_seqs is a SCHEDULER ADMISSION CAP -- it limits how many sequences may run
+    # CONCURRENTLY. It only binds when that many sequences are actually in flight. With
+    # n_prompts=1 there is exactly one sequence, so the cap never engages and every batch
+    # level executes the IDENTICAL computation. That is precisely what happened on
+    # 2026-07-27: captures at --max-num-seqs 8 and 11 returned verify intensities of 61.24
+    # and 61.25 (a 0.016% difference, i.e. noise) and byte-identical CSV sizes, because
+    # both were really running a batch of ONE. The energy sweep did not have this bug --
+    # it submits 32 prompts, and its throughput scales 238 -> 591 tok/s from batch 4 to 22,
+    # proving the cap works correctly when enough prompts are supplied.
+    # resolve_n_prompts() below enforces this automatically; see its docstring.
+    ap.add_argument("--n-prompts", type=int, default=1,
+                    help="keep tiny — ncu replays kernels. AUTO-RAISED to --max-num-seqs when "
+                         "that is larger, since the batch cap does not bind otherwise.")
     ap.add_argument("--max-tokens", type=int, default=8, help="keep tiny — ncu replays kernels")
     # ---- ridge-crossing experiment knobs (must MATCH the sweep cell being profiled) ----
     # The measured arithmetic intensity is only meaningful for the configuration it was
@@ -131,10 +168,16 @@ def main():
     install_roofline()                            # MUST be before building the LLM
     _bs = args.max_num_seqs
     _mml = args.max_model_len
+    # Enforce n_prompts >= max_num_seqs BEFORE loading prompts, or the batch cap is a no-op.
+    args.n_prompts = resolve_n_prompts(args.n_prompts, _bs)
     sm_env = _active_sm()
+    _conc = min(args.n_prompts, _bs) if _bs else args.n_prompts
     print(f"  building {args.model_pair} / {strat} "
           f"(max_num_seqs={_bs if _bs else 'default'}, max_model_len={_mml if _mml else 'default'}, "
           f"SMs={sm_env if sm_env else 'unrestricted'}) ...", file=sys.stderr)
+    print(f"  effective concurrency: {_conc} sequence(s)  "
+          f"(n_prompts={args.n_prompts}, max_num_seqs={_bs if _bs else 'default 8'})  "
+          f"<- THIS is the batch size the intensity will reflect", file=sys.stderr)
     if args.sm_count is not None and sm_env is not None and int(args.sm_count) != int(sm_env):
         # Catch the easy mistake: asking for an SM level but forgetting to launch under the
         # MPS-capped environment. The capture would then silently profile the FULL GPU.

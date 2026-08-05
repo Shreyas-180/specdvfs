@@ -17,8 +17,8 @@ set -euo pipefail
 
 # ----- EDIT THESE (read them off the Vast.ai SSH command: ssh -p PORT USER@HOST) -----
 VM_USER="root"            # the USER in  ssh -p PORT USER@HOST
-VM_HOST="153.198.14.8"         # the HOST/IP
-VM_PORT="52311"           # the PORT  (-p)
+VM_HOST=""         # the HOST/IP
+VM_PORT=""           # the PORT  (-p)
 REMOTE_DIR="specdvfs"     # folder to create in the VM's home dir; leave as-is
 # -------------------------------------------------------------------------------------
 

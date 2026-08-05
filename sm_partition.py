@@ -99,15 +99,37 @@ def premise_window(i_draft: float, i_verify: float, peak_tflops_full: float = 71
 
 
 def mps_daemon_running() -> bool:
-    """True if an MPS control daemon appears to be up."""
+    """True if an MPS control daemon appears to be up.
+
+    CORRECTED: nvidia-cuda-mps-control has NO '-s' status flag — an earlier version of this
+    function called `nvidia-cuda-mps-control -s` expecting a status query, which is not a real
+    invocation; it always returned False regardless of whether MPS was actually running. The
+    only ways the daemon accepts commands are (a) piped to its stdin, which is destructive for
+    most commands (e.g. 'quit' shuts it down) and unsuitable for a read-only check, or (b) not
+    at all via CLI flags. So this checks the two OBSERVABLE, non-destructive signals instead:
+      1. the control process itself is running (pgrep -f — see the flag note below), and
+      2. its control pipe exists in CUDA_MPS_PIPE_DIRECTORY (default /tmp/nvidia-mps) — the
+         daemon creates a named pipe called 'control' there on startup.
+    Both must hold; either alone can be a stale leftover (e.g. a crashed daemon can leave the
+    pipe file behind without a live process).
+    """
     if shutil.which("nvidia-cuda-mps-control") is None:
         return False
     try:
-        p = subprocess.run(["nvidia-cuda-mps-control", "-s"], capture_output=True,
-                           text=True, timeout=5)
-        return p.returncode == 0 and bool(p.stdout.strip())
+        # -f (full command line), NOT -x (exact match against comm). comm is truncated to 15
+        # chars by the kernel; "nvidia-cuda-mps-control" is 23 chars, so -x can NEVER match —
+        # that was the bug in an earlier version of this check (always False, regardless of
+        # whether MPS was actually running). -f matches the untruncated argv, same as the
+        # working manual check `pgrep -af nvidia-cuda-mps-control` (-a here is output
+        # formatting only; -f is what actually made that command find the process).
+        p = subprocess.run(["pgrep", "-f", "nvidia-cuda-mps-control"],
+                           capture_output=True, text=True, timeout=5)
+        proc_alive = p.returncode == 0 and bool(p.stdout.strip())
     except Exception:
-        return False
+        proc_alive = False
+    pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+    pipe_exists = os.path.exists(os.path.join(pipe_dir, "control"))
+    return proc_alive and pipe_exists
 
 
 def start_mps_daemon() -> bool:

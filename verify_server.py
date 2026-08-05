@@ -17,6 +17,26 @@ import sys
 import time
 import subprocess
 
+# --- The project's ACTUALLY CONFIGURED clocks (must track run_experiment.py's F_HIGH/F_LOW).
+# Deliberately NOT the card's reported max: different physical units of the "same" GPU model
+# are binned differently, and the very top of the boost range is frequently NOT sustain-
+# lockable — the firmware throttles it down even under an explicit clock-lock request. That is
+# exactly what "requested 2115, read 1725" is: a real, common phenomenon, not evidence this
+# card is broken. It is why F_HIGH=1935 was chosen as a separately-validated, sustainable
+# value in the first place, rather than trusting nvmlDeviceGetSupportedGraphicsClocks()[-1].
+# Testing lock effectiveness against the reported max (as an earlier version of this file did)
+# gates GO/NO-GO on a number the project never actually requests, producing a false NO-GO on
+# any card whose absolute ceiling happens to be unstable, while saying NOTHING about whether
+# the value actually used is safe on THIS physical unit.
+PROJECT_F_HIGH = 1935   # keep in sync with run_experiment.py's F_HIGH
+PROJECT_F_LOW = 735     # keep in sync with run_experiment.py's F_LOW
+
+
+def _snap(target, levels):
+    """Nearest supported clock level to `target` — same rule run_experiment.py's
+    resolve_clocks() uses, so this tests the EXACT value a real run would request."""
+    return min(levels, key=lambda c: abs(c - target))
+
 
 # ── result tracking ───────────────────────────────────────────────────────────
 
@@ -237,6 +257,29 @@ def check_lock_survives_load(pynvml, h, torch, f_low):
 
 # ── 7. power telemetry is real (CodeCarbon depends on it) ────────────────────
 
+def check_ceiling_lock_informational(pynvml, h, card_max):
+    """Does the card's own reported max hold under a lock request? WARN-level only.
+
+    The project never requests this frequency (see PROJECT_F_HIGH's comment) — this exists
+    purely to explain, when it fails, why a lower F_HIGH was the right call, and to flag a
+    card whose real usable range is narrower than nvmlDeviceGetSupportedGraphicsClocks()
+    advertises. It must never gate GO/NO-GO: a flaky boost ceiling says nothing about the
+    value actually used.
+    """
+    try:
+        pynvml.nvmlDeviceSetGpuLockedClocks(h, card_max, card_max)
+        time.sleep(0.5)
+        sm = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM)
+        ok = abs(sm - card_max) <= max(60, card_max * 0.10)
+        warn("card's reported ceiling actually sustain-locks", ok,
+             f"requested {card_max}, read {sm} MHz"
+             + ("" if ok else " — expected on many cards; firmware throttles the literal max "
+                              "even under an explicit lock. Not a problem for this project."))
+        pynvml.nvmlDeviceResetGpuLockedClocks(h)
+    except pynvml.NVMLError as e:
+        warn("card's reported ceiling actually sustain-locks", False, str(e)[:50])
+
+
 def check_power_telemetry(pynvml, h, torch):
     section("7. Power telemetry (CodeCarbon depends on this)")
     try:
@@ -277,13 +320,33 @@ def check_exclusivity(pynvml, h):
     section("8. GPU exclusivity (no co-tenants)")
     try:
         procs = pynvml.nvmlDeviceGetComputeRunningProcesses(h)
-        # This process itself may appear; warn if there is more than one.
-        n_other = len(procs)
-        warn("no other compute processes", n_other <= 1,
-             f"{n_other} compute processes on GPU — others' jobs corrupt energy data"
-             if n_other > 1 else "")
+        names = []
+        for p in procs:
+            try:
+                names.append(_proc_name(p.pid))
+            except Exception:
+                names.append(f"pid{p.pid}")
+        # If MPS is active, its control/server processes are EXPECTED co-tenants — that is
+        # the whole point of running under MPS (Approach 2's SM restriction requires it) — not
+        # a violation of exclusivity. Excluding them by name avoids a false positive that would
+        # otherwise fire on every '--sweep sm' run and mask a REAL second tenant if one existed.
+        mps_names = {"nvidia-cuda-mps-control", "nvidia-cuda-mps-server"}
+        other = [n for n in names if n not in mps_names]
+        n_other = len(other)
+        detail = f"{n_other} non-MPS compute process(es) on GPU — others' jobs corrupt energy data"
+        if len(names) != n_other:
+            detail += f" ({len(names) - n_other} MPS process(es) excluded, expected under --sweep sm)"
+        warn("no other compute processes", n_other <= 1, detail if n_other > 1 else "")
     except pynvml.NVMLError as e:
         warn("running process query", False, str(e)[:50])
+
+
+def _proc_name(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except Exception:
+        return f"pid{pid}"
 
 
 # ── 9. temperature ───────────────────────────────────────────────────────────
@@ -429,10 +492,29 @@ def main():
     check_persistence(pynvml, h)
     levels = check_clock_levels(pynvml, h)
     if levels is not None:
-        f_high, f_low, _ = levels
-        check_clock_lock_effective(pynvml, h, f_high, f_low)
-        check_lock_survives_load(pynvml, h, torch, f_low)
+        _, _, gfx_clocks = levels
+        # THE check that actually gates GO/NO-GO: lock to what the project will really
+        # request, not the card's raw ceiling. Snapped the same way resolve_clocks() snaps
+        # at runtime, so a PASS here is a direct guarantee about the real experiment.
+        proj_high = _snap(PROJECT_F_HIGH, gfx_clocks)
+        proj_low = _snap(PROJECT_F_LOW, gfx_clocks)
+        if proj_high != PROJECT_F_HIGH or proj_low != PROJECT_F_LOW:
+            warn("PROJECT_F_HIGH/F_LOW are exact card levels",
+                 proj_high == PROJECT_F_HIGH and proj_low == PROJECT_F_LOW,
+                 f"snapped to {proj_high}/{proj_low} on this card — "
+                 f"energy numbers would not be directly comparable to a run at the exact "
+                 f"1935/735 used elsewhere; consider --allow-clock-mismatch semantics.")
+        check_clock_lock_effective(pynvml, h, proj_high, proj_low)
+        check_lock_survives_load(pynvml, h, torch, proj_low)
         check_power_telemetry(pynvml, h, torch)
+        # Informational only: does the card's own reported ceiling hold under a lock request?
+        # NOT part of the GO/NO-GO verdict — the project never requests this value — but
+        # useful to know (e.g. it explains WHY 1935 was chosen below the reported max, and
+        # flags a card whose usable range may be narrower than its spec sheet suggests).
+        card_max = gfx_clocks[-1]
+        if card_max != proj_high:
+            section("5b. Card's reported ceiling (informational — NOT gating)")
+            check_ceiling_lock_informational(pynvml, h, card_max)
     check_exclusivity(pynvml, h)
     check_temperature(pynvml, h)
     check_vllm()
