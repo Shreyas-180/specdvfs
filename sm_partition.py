@@ -36,21 +36,6 @@ MECHANISM: MPS active-thread percentage
       * It cannot be changed mid-process -> an SM SWEEP must run ONE SUBPROCESS PER SM LEVEL.
         run_experiment.py does exactly that (see run_sm_sweep()).
     Requires compute capability >= 7.0 for the thread-percentage control; the 3090 is 8.6.
-
-ALTERNATIVE CONSIDERED (not used): CUDA Green Contexts (cuGreenCtxCreate, CUDA 12.4+) give
-    exact SM-count partitions rather than a percentage, but the green context must be made
-    current before vLLM builds its own context inside the worker process, which means patching
-    vLLM's worker init. MPS achieves the same experimental effect with no in-process CUDA API
-    surgery, so it is preferred here. If you later need exact SM counts, that is the upgrade
-    path; the percentages below are rounded to the nearest whole SM to stay auditable.
-
-HONEST CAVEAT
-    Percentage-based capping is not a guarantee of exactly N SMs, and with fewer SMs issuing
-    memory requests the ACHIEVED DRAM bandwidth can also drop somewhat (fewer outstanding
-    requests to saturate the controllers). If achieved bandwidth falls, the true ridge sits a
-    little LOWER than the linear model above predicts. That is why every SM level should be
-    re-profiled with ncu (analyze_roofline.py --sm-count N) rather than trusting this model:
-    the model picks the sweep points, the measurement decides the verdict.
 """
 
 from __future__ import annotations
@@ -135,7 +120,7 @@ def mps_daemon_running() -> bool:
 def start_mps_daemon() -> bool:
     """Try to start the MPS control daemon. Returns True if it is running afterwards.
 
-    Needs root (you are root on the Vast.ai VM). Safe to call when already running.
+    Needs root. Safe to call when already running.
     """
     if mps_daemon_running():
         return True
@@ -150,7 +135,7 @@ def start_mps_daemon() -> bool:
 
 
 def stop_mps_daemon() -> None:
-    """Shut the MPS daemon down (best effort) — leaves the GPU in its normal state."""
+    """Shut the MPS daemon down (best effort) - leaves the GPU in its normal state."""
     if shutil.which("nvidia-cuda-mps-control") is None:
         return
     try:
@@ -199,7 +184,7 @@ def active_sm_count(sm_total: int = SM_TOTAL_RTX3090):
 def preflight(n_sm, sm_total: int = SM_TOTAL_RTX3090, mock: bool = False) -> bool:
     """Check SM restriction can actually take effect. Returns True if it will.
 
-    Prints a LOUD warning when it will not: without the MPS daemon the percentage var is
+    Prints a warning when it will not: without the MPS daemon the percentage var is
     silently ignored by the driver, so an unguarded sweep would produce five identical
     full-GPU runs that merely LOOK like an SM sweep. Failing loudly here is the whole point.
     """
